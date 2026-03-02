@@ -4,7 +4,6 @@ on:
   push:
     branches:
       - main
-      - "codex/**"
   pull_request:
   schedule:
     - cron: "0 13 * * 1"
