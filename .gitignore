@@ -1,4 +1,9 @@
 target/
 .idea/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
 why-sql-inspect.md
 all-files.md

@@ -1,4 +1,5 @@
 use clap::{Parser, ValueEnum};
+use sql_ai_explainer::analyzer::{analyze_sql, StaticAnalysis};
 use sql_ai_explainer::error::AppError;
 use sql_ai_explainer::prompt::{build_prompt, parse_sql_explanation, SqlExplanation};
 use sql_ai_explainer::providers::bedrock::BedrockProvider;
@@ -39,6 +40,39 @@ fn read_sql_input(args: &Args) -> anyhow::Result<String> {
     }
 }
 
+fn push_unique(values: &mut Vec<String>, new_items: &[String]) {
+    for item in new_items {
+        if !values.iter().any(|existing| existing == item) {
+            values.push(item.clone());
+        }
+    }
+}
+
+fn merge_static_analysis(parsed: &mut SqlExplanation, analysis: &StaticAnalysis) {
+    push_unique(&mut parsed.anti_patterns, &analysis.anti_patterns);
+    push_unique(&mut parsed.risks, &analysis.risks);
+    push_unique(&mut parsed.suggestions, &analysis.suggestions);
+
+    if parsed.estimated_cost_impact == "unknown"
+        || cost_rank(&analysis.estimated_cost_impact) > cost_rank(&parsed.estimated_cost_impact)
+    {
+        parsed.estimated_cost_impact = analysis.estimated_cost_impact.clone();
+    }
+
+    if parsed.confidence == "unknown" && !analysis.anti_patterns.is_empty() {
+        parsed.confidence = "medium".to_string();
+    }
+}
+
+fn cost_rank(value: &str) -> u8 {
+    match value {
+        "low" => 1,
+        "medium" => 2,
+        "high" => 3,
+        _ => 0,
+    }
+}
+
 fn render_explanation(parsed: &SqlExplanation) -> String {
     let mut out = String::new();
 
@@ -46,10 +80,26 @@ fn render_explanation(parsed: &SqlExplanation) -> String {
     out.push_str(&parsed.summary);
     out.push_str("\n\n");
 
+    out.push_str("Estimated Cost Impact: ");
+    out.push_str(&parsed.estimated_cost_impact);
+    out.push('\n');
+
+    out.push_str("Confidence: ");
+    out.push_str(&parsed.confidence);
+    out.push('\n');
+
     if !parsed.tables.is_empty() {
-        out.push_str("Tables: ");
+        out.push_str("\nTables: ");
         out.push_str(&parsed.tables.join(", "));
         out.push('\n');
+    }
+    if !parsed.anti_patterns.is_empty() {
+        out.push_str("\nAnti-Patterns:\n");
+        for item in &parsed.anti_patterns {
+            out.push_str(" - ");
+            out.push_str(item);
+            out.push('\n');
+        }
     }
     if !parsed.joins.is_empty() {
         out.push_str("\nJoins:\n");
@@ -121,7 +171,9 @@ async fn main() -> Result<(), anyhow::Error> {
         return Ok(());
     }
 
-    let parsed = parse_sql_explanation(&raw_json)?;
+    let mut parsed = parse_sql_explanation(&raw_json)?;
+    let analysis = analyze_sql(&sql);
+    merge_static_analysis(&mut parsed, &analysis);
     print!("{}", render_explanation(&parsed));
 
     Ok(())
@@ -129,8 +181,9 @@ async fn main() -> Result<(), anyhow::Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{read_sql_input, render_explanation, Args, ProviderArg};
+    use super::{merge_static_analysis, read_sql_input, render_explanation, Args, ProviderArg};
     use clap::Parser;
+    use sql_ai_explainer::analyzer::analyze_sql;
     use sql_ai_explainer::prompt::SqlExplanation;
 
     #[test]
@@ -229,12 +282,18 @@ mod tests {
             filters: vec!["created_at >= current_date - interval '30 days'".to_string()],
             risks: vec!["selectivity unknown".to_string()],
             suggestions: vec!["add an index on orders.customer_id".to_string()],
+            anti_patterns: vec!["SELECT *".to_string()],
+            estimated_cost_impact: "medium".to_string(),
+            confidence: "high".to_string(),
         };
 
         let rendered = render_explanation(&parsed);
 
         assert!(rendered.contains("\nSummary:\nReads recent orders\n"));
-        assert!(rendered.contains("Tables: orders, customers"));
+        assert!(rendered.contains("Estimated Cost Impact: medium"));
+        assert!(rendered.contains("Confidence: high"));
+        assert!(rendered.contains("\nTables: orders, customers"));
+        assert!(rendered.contains("\nAnti-Patterns:\n - SELECT *\n"));
         assert!(rendered.contains("\nJoins:\n - INNER JOIN customers ON customer_id\n"));
         assert!(
             rendered.contains("\nFilters:\n - created_at >= current_date - interval '30 days'\n")
@@ -252,15 +311,47 @@ mod tests {
             filters: vec![],
             risks: vec![],
             suggestions: vec![],
+            anti_patterns: vec![],
+            estimated_cost_impact: "low".to_string(),
+            confidence: "medium".to_string(),
         };
 
         let rendered = render_explanation(&parsed);
 
         assert!(rendered.contains("Summary:\nSimple query"));
+        assert!(rendered.contains("Estimated Cost Impact: low"));
+        assert!(rendered.contains("Confidence: medium"));
         assert!(!rendered.contains("Tables:"));
+        assert!(!rendered.contains("Anti-Patterns:"));
         assert!(!rendered.contains("Joins:"));
         assert!(!rendered.contains("Filters:"));
         assert!(!rendered.contains("Risks:"));
         assert!(!rendered.contains("Suggestions:"));
+    }
+
+    #[test]
+    fn merge_static_analysis_adds_local_findings() {
+        let mut parsed = SqlExplanation {
+            summary: "Query review".to_string(),
+            tables: vec!["orders".to_string()],
+            joins: vec![],
+            filters: vec![],
+            risks: vec![],
+            suggestions: vec![],
+            anti_patterns: vec![],
+            estimated_cost_impact: "unknown".to_string(),
+            confidence: "unknown".to_string(),
+        };
+
+        let analysis = analyze_sql("SELECT * FROM orders");
+        merge_static_analysis(&mut parsed, &analysis);
+
+        assert!(parsed.anti_patterns.iter().any(|x| x == "SELECT *"));
+        assert!(parsed
+            .risks
+            .iter()
+            .any(|x| x.contains("scan unnecessary columns")));
+        assert_eq!(parsed.estimated_cost_impact, "medium");
+        assert_eq!(parsed.confidence, "medium");
     }
 }

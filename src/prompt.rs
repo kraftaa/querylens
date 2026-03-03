@@ -1,20 +1,36 @@
 use serde::{Deserialize, Serialize};
 
+fn unknown_string() -> String {
+    "unknown".to_string()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SqlExplanation {
     pub summary: String,
+    #[serde(default)]
     pub tables: Vec<String>,
+    #[serde(default)]
     pub joins: Vec<String>,
+    #[serde(default)]
     pub filters: Vec<String>,
+    #[serde(default)]
     pub risks: Vec<String>,
+    #[serde(default)]
     pub suggestions: Vec<String>,
+    #[serde(default)]
+    pub anti_patterns: Vec<String>,
+    #[serde(default = "unknown_string")]
+    pub estimated_cost_impact: String,
+    #[serde(default = "unknown_string")]
+    pub confidence: String,
 }
 
 pub fn build_prompt(sql: &str) -> String {
     format!(
         r#"You are a SQL reviewer. ONLY use the SQL text provided. If something is unknown, write "unknown".
 Return STRICT JSON with keys:
-summary (string), tables (array), joins (array), filters (array), risks (array), suggestions (array).
+summary (string), tables (array), joins (array), filters (array), risks (array), suggestions (array),
+anti_patterns (array), estimated_cost_impact (string: low|medium|high|unknown), confidence (string: low|medium|high|unknown).
 
 SQL:
 ```sql
@@ -55,13 +71,36 @@ mod tests {
             "joins":[],
             "filters":["created_at >= current_date - interval '30 days'"],
             "risks":["select * may read unnecessary columns"],
-            "suggestions":["Project only needed columns"]
+            "suggestions":["Project only needed columns"],
+            "anti_patterns":["SELECT *"],
+            "estimated_cost_impact":"medium",
+            "confidence":"high"
         }"#;
 
         let parsed = parse_sql_explanation(raw).expect("valid JSON should parse");
         assert_eq!(parsed.summary, "Finds recent orders");
         assert_eq!(parsed.tables, vec!["orders"]);
         assert_eq!(parsed.suggestions, vec!["Project only needed columns"]);
+        assert_eq!(parsed.anti_patterns, vec!["SELECT *"]);
+        assert_eq!(parsed.estimated_cost_impact, "medium");
+        assert_eq!(parsed.confidence, "high");
+    }
+
+    #[test]
+    fn parse_sql_explanation_defaults_new_fields_for_older_payloads() {
+        let raw = r#"{
+            "summary":"Legacy payload",
+            "tables":[],
+            "joins":[],
+            "filters":[],
+            "risks":[],
+            "suggestions":[]
+        }"#;
+
+        let parsed = parse_sql_explanation(raw).expect("legacy JSON should still parse");
+        assert!(parsed.anti_patterns.is_empty());
+        assert_eq!(parsed.estimated_cost_impact, "unknown");
+        assert_eq!(parsed.confidence, "unknown");
     }
 
     #[test]

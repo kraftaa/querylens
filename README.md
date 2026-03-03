@@ -1,6 +1,13 @@
 # sql-ai-explainer
 
-CLI tool that sends SQL to an LLM and expects strict JSON back:
+CLI tool that reviews SQL for reliability and cost risk.
+
+It combines:
+
+- deterministic static checks for common anti-patterns
+- LLM-generated structured explanations and suggestions
+
+Current structured output includes:
 
 - `summary`
 - `tables`
@@ -8,11 +15,24 @@ CLI tool that sends SQL to an LLM and expects strict JSON back:
 - `filters`
 - `risks`
 - `suggestions`
+- `anti_patterns`
+- `estimated_cost_impact`
+- `confidence`
 
 Supports:
 
 - OpenAI (`/v1/responses`)
 - AWS Bedrock (`invoke_model`)
+
+Static checks currently detect patterns such as:
+
+- `SELECT *`
+- missing `WHERE`
+- multiple joins / wide joins
+- leading wildcard `LIKE '%x'`
+- `CROSS JOIN`
+
+The tool may also suggest adding `LIMIT` for likely ad hoc exploration queries, but missing `LIMIT` is not treated as a general anti-pattern.
 
 ## Project Layout
 
@@ -63,6 +83,7 @@ Additional commands:
 make smoke-openai
 make smoke-bedrock
 make audit
+make secrets
 ```
 
 ## Usage
@@ -118,7 +139,7 @@ You can also pass a different SQL file:
 
 ## Output Modes
 
-Default mode validates model output against the `SqlExplanation` struct and prints a readable summary.
+Default mode validates model output against the `SqlExplanation` struct, merges local static findings, and prints a readable summary.
 
 `--json` mode prints the raw model output, useful when troubleshooting schema mismatches.
 
@@ -130,10 +151,30 @@ Default mode validates model output against the `SqlExplanation` struct and prin
   - `src/providers/openai.rs`
   - `src/providers/bedrock.rs`
 
+## Secret Safety
+
+Local secret files are ignored by git:
+
+- `.env`
+- `.env.*`
+
+Template files are still allowed:
+
+- `.env.example`
+- `.env.sample`
+- `.env.template`
+
+For local scanning, if `gitleaks` is installed:
+
+```bash
+make secrets
+```
+
 ## CI And Release
 
 GitHub Actions included in this repo:
 
 - `CI`: runs format, tests, and clippy on pushes/PRs
 - `Audit`: runs `cargo-deny` on pushes/PRs and weekly on Mondays
+- `Secrets`: runs `gitleaks` on pushes/PRs
 - `Release`: builds release binaries for Linux and macOS on `v*` tags and attaches them to a GitHub release

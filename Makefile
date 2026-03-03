@@ -1,4 +1,4 @@
-.PHONY: fmt check test lint ci smoke-openai smoke-bedrock audit
+.PHONY: fmt check test lint ci smoke-openai smoke-bedrock audit secrets
 
 fmt:
 	cargo fmt --all
@@ -20,6 +20,9 @@ smoke-bedrock:
 
 audit:
 	cargo deny check advisories licenses bans sources
+
+secrets:
+	gitleaks detect --source . --no-git
 
 ci:
 	cargo fmt --all --check
