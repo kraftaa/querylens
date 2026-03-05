@@ -166,9 +166,34 @@ fail_on = "high"
 glob = "*.sql"
 suggest_limit_for_exploratory = true
 static_only = false
+
+[rules.SELECT_STAR]
+enabled = true
+severity = "high"
+
+[rules.MISSING_WHERE]
+enabled = true
+severity = "medium"
 ```
 
 An example is included at `sql-inspect.toml.example`.
+
+### Rule Controls
+
+You can control rules by `rule_id` in config:
+
+- `enabled = false` disables that finding
+- `severity = "low|medium|high"` overrides severity
+
+Example:
+
+```toml
+[rules.SELECT_STAR]
+enabled = false
+
+[rules.MISSING_WHERE]
+severity = "low"
+```
 
 ## Tested Commands
 

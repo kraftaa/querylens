@@ -3,3 +3,11 @@ fail_on = "high"
 glob = "*.sql"
 suggest_limit_for_exploratory = true
 static_only = false
+
+[rules.SELECT_STAR]
+enabled = true
+severity = "high"
+
+[rules.MISSING_WHERE]
+enabled = true
+severity = "medium"

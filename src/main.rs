@@ -102,13 +102,17 @@ fn to_severity(arg: SeverityArg) -> Severity {
     }
 }
 
-fn config_fail_on(config: &SqlInspectConfig) -> Option<Severity> {
-    match config.fail_on.as_deref() {
-        Some("low") => Some(Severity::Low),
-        Some("medium") => Some(Severity::Medium),
-        Some("high") => Some(Severity::High),
+fn parse_severity_name(value: &str) -> Option<Severity> {
+    match value {
+        "low" => Some(Severity::Low),
+        "medium" => Some(Severity::Medium),
+        "high" => Some(Severity::High),
         _ => None,
     }
+}
+
+fn config_fail_on(config: &SqlInspectConfig) -> Option<Severity> {
+    config.fail_on.as_deref().and_then(parse_severity_name)
 }
 
 fn analysis_options(config: &SqlInspectConfig) -> AnalysisOptions {
@@ -190,6 +194,38 @@ fn merge_static_analysis(parsed: &mut SqlExplanation, analysis: &StaticAnalysis)
 
     if parsed.confidence == "unknown" && !analysis.findings.is_empty() {
         parsed.confidence = "medium".to_string();
+    }
+}
+
+fn apply_rule_controls(parsed: &mut SqlExplanation, config: &SqlInspectConfig) {
+    let Some(rules) = config.rules.as_ref() else {
+        return;
+    };
+
+    let mut disabled_messages = Vec::new();
+    parsed.findings.retain(|finding| {
+        let Some(control) = rules.get(&finding.rule_id) else {
+            return true;
+        };
+        if control.enabled == Some(false) {
+            disabled_messages.push(finding.message.clone());
+            return false;
+        }
+        true
+    });
+
+    for finding in &mut parsed.findings {
+        if let Some(control) = rules.get(&finding.rule_id) {
+            if let Some(severity_name) = control.severity.as_deref() {
+                if let Some(severity) = parse_severity_name(severity_name) {
+                    finding.severity = severity;
+                }
+            }
+        }
+    }
+
+    for message in disabled_messages {
+        parsed.anti_patterns.retain(|item| item != &message);
     }
 }
 
@@ -420,7 +456,10 @@ async fn main() -> Result<(), anyhow::Error> {
         }
     };
 
-    let threshold = args.fail_on.map(to_severity).or_else(|| config_fail_on(&config));
+    let threshold = args
+        .fail_on
+        .map(to_severity)
+        .or_else(|| config_fail_on(&config));
     let mut options = analysis_options(&config);
     if let Some(dialect) = args.dialect {
         options.dialect = cli_dialect(dialect);
@@ -431,7 +470,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
     match input {
         InputMode::Sql(sql) => {
-            let parsed = analyze_single_sql(&sql, static_only, &args, options).await?;
+            let mut parsed = analyze_single_sql(&sql, static_only, &args, options).await?;
+            apply_rule_controls(&mut parsed, &config);
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&parsed)?);
             } else {
@@ -444,6 +484,7 @@ async fn main() -> Result<(), anyhow::Error> {
         }
         InputMode::File(path, sql) => {
             let mut parsed = analyze_single_sql(&sql, static_only, &args, options).await?;
+            apply_rule_controls(&mut parsed, &config);
             if parsed.summary == "Static analysis found no obvious anti-patterns." {
                 parsed.summary = format!("Static analysis for {}", path.display());
             }
@@ -466,7 +507,8 @@ async fn main() -> Result<(), anyhow::Error> {
 
             for file in files {
                 let sql = std::fs::read_to_string(&file)?;
-                let parsed = analyze_single_sql(&sql, true, &args, options).await?;
+                let mut parsed = analyze_single_sql(&sql, true, &args, options).await?;
+                apply_rule_controls(&mut parsed, &config);
                 should_exit |= should_fail(&parsed.findings, threshold.clone());
                 reports.push(FileReport {
                     path: file.display().to_string(),
@@ -495,12 +537,14 @@ async fn main() -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        collect_sql_files, matches_pattern, merge_static_analysis, read_input, render_explanation,
-        should_fail, Args, DialectArg, InputMode, ProviderArg, SeverityArg,
+        apply_rule_controls, collect_sql_files, matches_pattern, merge_static_analysis, read_input,
+        render_explanation, should_fail, Args, DialectArg, InputMode, ProviderArg, SeverityArg,
     };
     use clap::Parser;
     use sql_ai_explainer::analyzer::{analyze_sql, AnalysisOptions};
+    use sql_ai_explainer::config::{RuleControl, SqlInspectConfig};
     use sql_ai_explainer::prompt::{Finding, Severity, SqlExplanation};
+    use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     #[test]
@@ -707,6 +751,83 @@ mod tests {
         assert!(should_fail(&findings, Some(Severity::Medium)));
         assert!(should_fail(&findings, Some(Severity::High)));
         assert!(!should_fail(&[], Some(Severity::Low)));
+    }
+
+    #[test]
+    fn rule_controls_can_disable_findings() {
+        let mut parsed = SqlExplanation {
+            summary: "Query review".to_string(),
+            tables: vec![],
+            joins: vec![],
+            filters: vec![],
+            risks: vec![],
+            suggestions: vec![],
+            anti_patterns: vec!["SELECT *".to_string()],
+            findings: vec![Finding {
+                rule_id: "SELECT_STAR".to_string(),
+                severity: Severity::High,
+                message: "SELECT *".to_string(),
+                why_it_matters: "bad".to_string(),
+                evidence: vec!["SELECT *".to_string()],
+            }],
+            estimated_cost_impact: "high".to_string(),
+            confidence: "high".to_string(),
+        };
+
+        let mut rules = HashMap::new();
+        rules.insert(
+            "SELECT_STAR".to_string(),
+            RuleControl {
+                enabled: Some(false),
+                severity: None,
+            },
+        );
+        let config = SqlInspectConfig {
+            rules: Some(rules),
+            ..SqlInspectConfig::default()
+        };
+
+        apply_rule_controls(&mut parsed, &config);
+        assert!(parsed.findings.is_empty());
+        assert!(!parsed.anti_patterns.iter().any(|x| x == "SELECT *"));
+    }
+
+    #[test]
+    fn rule_controls_can_override_severity() {
+        let mut parsed = SqlExplanation {
+            summary: "Query review".to_string(),
+            tables: vec![],
+            joins: vec![],
+            filters: vec![],
+            risks: vec![],
+            suggestions: vec![],
+            anti_patterns: vec![],
+            findings: vec![Finding {
+                rule_id: "MISSING_WHERE".to_string(),
+                severity: Severity::Medium,
+                message: "No WHERE clause".to_string(),
+                why_it_matters: "bad".to_string(),
+                evidence: vec![],
+            }],
+            estimated_cost_impact: "medium".to_string(),
+            confidence: "high".to_string(),
+        };
+
+        let mut rules = HashMap::new();
+        rules.insert(
+            "MISSING_WHERE".to_string(),
+            RuleControl {
+                enabled: Some(true),
+                severity: Some("low".to_string()),
+            },
+        );
+        let config = SqlInspectConfig {
+            rules: Some(rules),
+            ..SqlInspectConfig::default()
+        };
+
+        apply_rule_controls(&mut parsed, &config);
+        assert_eq!(parsed.findings[0].severity, Severity::Low);
     }
 
     fn temp_test_dir(name: &str) -> PathBuf {

@@ -1,5 +1,12 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RuleControl {
+    pub enabled: Option<bool>,
+    pub severity: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct SqlInspectConfig {
@@ -8,6 +15,7 @@ pub struct SqlInspectConfig {
     pub glob: Option<String>,
     pub suggest_limit_for_exploratory: Option<bool>,
     pub static_only: Option<bool>,
+    pub rules: Option<HashMap<String, RuleControl>>,
 }
 
 pub fn load_config(path: Option<&Path>) -> anyhow::Result<SqlInspectConfig> {
@@ -56,7 +64,7 @@ mod tests {
         let path = tmp.join("sql-inspect.toml");
         std::fs::write(
             &path,
-            "dialect = \"athena\"\nfail_on = \"medium\"\nglob = \"*.sql\"\nsuggest_limit_for_exploratory = false\n",
+            "dialect = \"athena\"\nfail_on = \"medium\"\nglob = \"*.sql\"\nsuggest_limit_for_exploratory = false\n[rules.SELECT_STAR]\nenabled = false\nseverity = \"medium\"\n",
         )
         .expect("write config");
 
@@ -65,6 +73,13 @@ mod tests {
         assert_eq!(config.fail_on.as_deref(), Some("medium"));
         assert_eq!(config.glob.as_deref(), Some("*.sql"));
         assert_eq!(config.suggest_limit_for_exploratory, Some(false));
+        let select_star = config
+            .rules
+            .as_ref()
+            .and_then(|rules| rules.get("SELECT_STAR"))
+            .expect("SELECT_STAR rule override should exist");
+        assert_eq!(select_star.enabled, Some(false));
+        assert_eq!(select_star.severity.as_deref(), Some("medium"));
 
         std::fs::remove_dir_all(tmp).expect("cleanup");
     }
