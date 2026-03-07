@@ -2,7 +2,7 @@ use clap::{Parser, ValueEnum};
 use sql_ai_explainer::analyzer::{analyze_sql, AnalysisOptions, Dialect, StaticAnalysis};
 use sql_ai_explainer::config::{load_config, SqlInspectConfig};
 use sql_ai_explainer::error::AppError;
-use sql_ai_explainer::insights::{explain_query, extract_lineage, extract_tables};
+use sql_ai_explainer::insights::{explain_query, extract_lineage_report, extract_tables};
 use sql_ai_explainer::prompt::{
     build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation,
 };
@@ -499,15 +499,35 @@ fn read_sql_file(path: &Path) -> anyhow::Result<String> {
 }
 
 fn render_lineage(path: &Path, sql: &str) -> String {
-    let lineage = extract_lineage(sql);
+    let report = extract_lineage_report(sql);
     let mut out = String::new();
     out.push_str(&format!("{}\n", path.display()));
-    for item in lineage {
+
+    out.push_str("Projections:\n");
+    for item in report.projections {
         out.push_str(&item.output);
         out.push('\n');
         out.push_str(" └─ ");
         out.push_str(&item.expression);
         out.push('\n');
+    }
+
+    if !report.filters.is_empty() {
+        out.push_str("Filters:\n");
+        for filter in report.filters {
+            out.push_str(" └─ ");
+            out.push_str(&filter);
+            out.push('\n');
+        }
+    }
+
+    if !report.joins.is_empty() {
+        out.push_str("Joins:\n");
+        for join in report.joins {
+            out.push_str(" └─ ");
+            out.push_str(&join);
+            out.push('\n');
+        }
     }
     out
 }
