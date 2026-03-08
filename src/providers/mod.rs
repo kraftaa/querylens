@@ -4,6 +4,7 @@ use crate::error::AppError;
 pub enum ProviderKind {
     OpenAI,
     Bedrock,
+    Local,
 }
 
 #[async_trait::async_trait]
@@ -12,4 +13,5 @@ pub trait LlmProvider: Send + Sync {
 }
 
 pub mod bedrock;
+pub mod local;
 pub mod openai;

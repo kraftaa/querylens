@@ -1,20 +1,20 @@
 use clap::{Parser, ValueEnum};
-use sql_ai_explainer::analyzer::{analyze_sql, AnalysisOptions, Dialect, StaticAnalysis};
-use sql_ai_explainer::config::{load_config, SqlInspectConfig};
-use sql_ai_explainer::error::AppError;
-use sql_ai_explainer::insights::{explain_query, extract_lineage_report, extract_tables};
-use sql_ai_explainer::prompt::{
-    build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation,
-};
-use sql_ai_explainer::providers::bedrock::BedrockProvider;
-use sql_ai_explainer::providers::openai::OpenAIProvider;
-use sql_ai_explainer::providers::LlmProvider;
+use sql_inspect::analyzer::{analyze_sql, AnalysisOptions, Dialect, StaticAnalysis};
+use sql_inspect::config::{load_config, SqlInspectConfig};
+use sql_inspect::error::AppError;
+use sql_inspect::insights::{explain_query, extract_lineage_report, extract_tables};
+use sql_inspect::prompt::{build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation};
+use sql_inspect::providers::bedrock::BedrockProvider;
+use sql_inspect::providers::local::LocalProvider;
+use sql_inspect::providers::openai::OpenAIProvider;
+use sql_inspect::providers::LlmProvider;
 use std::path::{Path, PathBuf};
 
 #[derive(ValueEnum, Clone, Debug)]
 enum ProviderArg {
     Openai,
     Bedrock,
+    Local,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug)]
@@ -49,7 +49,7 @@ enum Commands {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "sql-ai-explainer")]
+#[command(name = "sql-inspect")]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -422,6 +422,13 @@ async fn build_provider(args: &Args) -> Result<Box<dyn LlmProvider>, anyhow::Err
             let provider = BedrockProvider::new(model_id).await?;
             Ok(Box::new(provider))
         }
+        ProviderArg::Local => {
+            let model = env("LOCAL_LLM_MODEL")?;
+            let base_url = std::env::var("LOCAL_LLM_BASE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+            let api_key = std::env::var("LOCAL_LLM_API_KEY").ok();
+            Ok(Box::new(LocalProvider::new(base_url, model, api_key)))
+        }
     }
 }
 
@@ -726,16 +733,16 @@ mod tests {
         DialectArg, InputMode, ProviderArg, SeverityArg,
     };
     use clap::Parser;
-    use sql_ai_explainer::analyzer::{analyze_sql, AnalysisOptions};
-    use sql_ai_explainer::config::{RuleControl, SqlInspectConfig};
-    use sql_ai_explainer::prompt::{Finding, Severity, SqlExplanation};
+    use sql_inspect::analyzer::{analyze_sql, AnalysisOptions};
+    use sql_inspect::config::{RuleControl, SqlInspectConfig};
+    use sql_inspect::prompt::{Finding, Severity, SqlExplanation};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     #[test]
     fn args_parse_inline_sql() {
-        let args = Args::try_parse_from(["sql-ai-explainer", "--sql", "select 1"])
-            .expect("args should parse");
+        let args =
+            Args::try_parse_from(["sql-inspect", "--sql", "select 1"]).expect("args should parse");
 
         assert!(matches!(args.provider, ProviderArg::Openai));
         assert_eq!(args.sql.as_deref(), Some("select 1"));
@@ -746,7 +753,7 @@ mod tests {
 
     #[test]
     fn args_parse_tables_subcommand() {
-        let args = Args::try_parse_from(["sql-ai-explainer", "tables", "examples/query.sql"])
+        let args = Args::try_parse_from(["sql-inspect", "tables", "examples/query.sql"])
             .expect("subcommand args should parse");
         assert!(matches!(args.command, Some(Commands::Tables { .. })));
     }
@@ -754,7 +761,7 @@ mod tests {
     #[test]
     fn args_parse_dir_and_fail_threshold() {
         let args = Args::try_parse_from([
-            "sql-ai-explainer",
+            "sql-inspect",
             "--dir",
             "models",
             "--dialect",

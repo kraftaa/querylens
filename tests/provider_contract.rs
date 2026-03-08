@@ -1,6 +1,6 @@
-use sql_ai_explainer::error::AppError;
-use sql_ai_explainer::prompt::{build_prompt, parse_sql_explanation};
-use sql_ai_explainer::providers::LlmProvider;
+use sql_inspect::error::AppError;
+use sql_inspect::prompt::{build_prompt, parse_sql_explanation};
+use sql_inspect::providers::LlmProvider;
 
 struct FakeProvider {
     response: String,

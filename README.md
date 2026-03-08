@@ -1,111 +1,160 @@
-# sql-ai-explainer
+# sql-inspect
 
-CLI tool that reviews SQL for reliability and cost risk.
+Static SQL analysis for reliability and cost risk.
 
-It combines:
+## Example
 
-- deterministic static checks for common anti-patterns
-- LLM-generated structured explanations and suggestions
+Input SQL:
 
-Current structured output includes:
+```sql
+SELECT
+  c.customer_id,
+  SUM(o.amount) AS revenue
+FROM customers c
+JOIN orders o
+  ON c.id = o.customer_id
+GROUP BY c.customer_id
+```
 
-- `summary`
-- `tables`
-- `joins`
-- `filters`
-- `risks`
-- `suggestions`
-- `anti_patterns`
-- `findings` with `rule_id`, `severity`, `message`, `why_it_matters`, `evidence`
-- `estimated_cost_impact`
-- `confidence`
+Command:
 
-Additional CLI features:
+```bash
+cargo run -- lineage examples/revenue.sql
+```
 
-- `lineage <file>`: basic column lineage extraction
-- `tables <file>`: table dependency extraction
-- `explain <file>`: compact query explanation
-- `analyze <dir>`: folder-level static analysis summary
-
-Supports:
-
-- OpenAI (`/v1/responses`)
-- AWS Bedrock (`invoke_model`)
-- dialect-aware static analysis (`generic`, `athena`)
-
-Static checks currently detect patterns such as:
-
-- `SELECT *`
-- missing `WHERE`
-- multiple joins / wide joins
-- leading wildcard `LIKE '%x'`
-- `CROSS JOIN`
-- possible Cartesian join (`JOIN` without `ON/USING`)
-- `IN (SELECT ...)` subquery suggestion
-
-The tool may also suggest adding `LIMIT` for likely ad hoc exploration queries, but missing `LIMIT` is not treated as a general anti-pattern.
-
-Athena mode adds heuristics such as:
-
-- no obvious partition/date filter
-- `ORDER BY` without `LIMIT`
-- `COUNT(DISTINCT ...)` suggestion toward `approx_distinct`
-
-## Project Layout
+Output:
 
 ```text
-sql-ai-explainer/
-  Cargo.toml
-  src/
-    main.rs
-    lib.rs
-    error.rs
-    prompt.rs
-    providers/
-      mod.rs
-      openai.rs
-      bedrock.rs
+examples/revenue.sql
+Projections:
+revenue
+ └─ SUM(orders.amount)
+o.customer_id
+ └─ orders.customer_id
 ```
 
-## Prerequisites
+## Why This Exists
 
-- Rust (stable)
-- For OpenAI usage:
-  - `OPENAI_API_KEY`
-  - optional: `OPENAI_MODEL` (default is `gpt-4.1-mini`)
-- For Bedrock usage:
-  - AWS credentials (profile/role/env)
-  - `AWS_REGION`
-  - `BEDROCK_MODEL_ID` (example: `anthropic.claude-3-5-sonnet-20241022-v2:0`)
+SQL pipelines grow quickly and are hard to review.
 
-## Build
+When a metric looks wrong, teams need to:
 
-```bash
-cargo check
+- trace where output columns come from
+- catch risky query patterns before they hit production
+- understand query intent quickly
+
+`sql-inspect` helps with deterministic checks and optional LLM explanations.
+
+## Features
+
+| Feature | Description |
+|---|---|
+| Static SQL checks | Detect risky patterns (`SELECT *`, possible Cartesian joins, wildcard `LIKE`, etc.) |
+| Column lineage | Trace projection, filter, and join lineage |
+| Query explanation | Summarize purpose, tables, and aggregations |
+| Table extraction | List tables used by a query |
+| Folder scanning | Analyze a directory of SQL files |
+| Rule controls | Disable rules or override severity by `rule_id` |
+| Athena mode | Extra heuristics for partition/cost patterns |
+| CI thresholds | Fail on `low|medium|high` severity |
+
+## Detect Risky SQL Patterns
+
+Example query:
+
+```sql
+SELECT *
+FROM orders o
+JOIN customers c
 ```
 
-## Local Commands
+Command:
 
 ```bash
-make fmt
-make check
-make test
-make lint
-make ci
+cargo run -- --file examples/bad_join.sql --static-only
 ```
 
-Additional commands:
+Expected findings include:
+
+- `SELECT *`
+- possible Cartesian join (`JOIN` without `ON/USING`)
+
+Example subquery pattern:
 
 ```bash
-make smoke-openai
-make smoke-bedrock
-make audit
-make secrets
+cargo run -- --file examples/subquery.sql --static-only
+```
+
+Expected suggestion includes:
+
+- consider replacing `IN (SELECT ...)` with `JOIN` or `EXISTS`
+
+## How Is This Different From dbt?
+
+dbt builds and runs transformation pipelines.
+
+`sql-inspect` analyzes SQL itself:
+
+- detect risky query patterns
+- trace lineage in query text
+- explain query logic
+
+They complement each other: dbt for orchestration/modeling, `sql-inspect` for query inspection.
+
+## Installation
+
+```bash
+cargo build
+```
+
+## Distribution
+
+### GitHub Releases (prebuilt binaries)
+
+Tagging `v*` triggers `.github/workflows/release.yml` and publishes:
+
+- `sql-inspect-macos-aarch64.tar.gz`
+- `sql-inspect-linux-x86_64.tar.gz`
+- `SHA256SUMS`
+
+Create a release tag:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+### Homebrew tap
+
+Use the formula template at:
+
+- `packaging/homebrew/sql-inspect.rb`
+
+For each release:
+
+1. Set `version` (without `v`).
+2. Fill `__SHA256_MACOS_AARCH64__` and `__SHA256_LINUX_X86_64__` from `SHA256SUMS`.
+3. Commit the formula in your tap repo (for example `kraftaa/homebrew-tap`) as `Formula/sql-inspect.rb`.
+4. Users install with:
+
+```bash
+brew install kraftaa/tap/sql-inspect
 ```
 
 ## Usage
 
-Provide exactly one of:
+### Subcommands
+
+```bash
+cargo run -- lineage <file.sql>
+cargo run -- tables <file.sql>
+cargo run -- explain <file.sql>
+cargo run -- analyze <dir> --glob "*.sql"
+```
+
+### Main Analyze Command (LLM + static)
+
+Provide one of:
 
 - `--sql "<query>"`
 - `--file <path>`
@@ -113,74 +162,41 @@ Provide exactly one of:
 
 Optional:
 
-- `--provider openai|bedrock` (default: `openai`)
+- `--provider openai|bedrock|local`
 - `--dialect generic|athena`
-- `--glob <pattern>` for directory scans (default: `*.sql`)
-- `--config <path>` to load `sql-inspect.toml`
-- `--static-only` to skip the LLM and run deterministic checks only
-- `--fail-on low|medium|high` to exit non-zero when findings meet the threshold
-- `--json` to print raw JSON returned by the model
+- `--static-only`
+- `--fail-on low|medium|high`
+- `--glob "*.sql"`
+- `--config sql-inspect.toml`
+- `--json`
 
-Subcommands:
-
-- `sql-inspect lineage <file>`
-- `sql-inspect tables <file>`
-- `sql-inspect explain <file>`
-- `sql-inspect analyze <dir> --glob "*.sql"`
-
-### OpenAI Example
+OpenAI example:
 
 ```bash
 export OPENAI_API_KEY="..."
 export OPENAI_MODEL="gpt-4.1-mini"
-
 cargo run -- --provider openai --file examples/query.sql
 ```
 
-### Bedrock Example
+Bedrock example:
 
 ```bash
 export AWS_REGION="us-east-1"
 export BEDROCK_MODEL_ID="anthropic.claude-3-5-sonnet-20241022-v2:0"
-
 cargo run -- --provider bedrock --file examples/query.sql
 ```
 
-### Inline SQL Example
+Local OpenAI-compatible server example:
 
 ```bash
-cargo run -- --provider openai --sql "select * from orders o join customers c on o.customer_id = c.id where o.created_at >= current_date - interval '30 days'"
+export LOCAL_LLM_BASE_URL="http://127.0.0.1:8080"
+export LOCAL_LLM_MODEL="llama_instruct.gguf"
+cargo run -- --provider local --file examples/query.sql --json
 ```
 
-### Directory Scan Example
+## Config
 
-Directory scanning currently runs in static-analysis mode so you can use it in CI without provider credentials.
-
-```bash
-cargo run -- --dir models --dialect athena --glob "*.sql" --fail-on high
-```
-
-Equivalent subcommand form:
-
-```bash
-cargo run -- analyze models --glob "*.sql"
-```
-
-### Static-Only Example
-
-```bash
-cargo run -- --file examples/query.sql --static-only
-```
-
-Tested result with the included sample query:
-
-- summary: static analysis for `examples/query.sql`
-- estimated cost impact: `low`
-- no findings for the current sample query
-
-### Config File Example
-
-Create `sql-inspect.toml` in the project root:
+Create `sql-inspect.toml`:
 
 ```toml
 dialect = "athena"
@@ -198,13 +214,9 @@ enabled = true
 severity = "medium"
 ```
 
-An example is included at `sql-inspect.toml.example`.
+Rule controls:
 
-### Rule Controls
-
-You can control rules by `rule_id` in config:
-
-- `enabled = false` disables that finding
+- `enabled = false` disables a finding by `rule_id`
 - `severity = "low|medium|high"` overrides severity
 
 Example:
@@ -217,74 +229,50 @@ enabled = false
 severity = "low"
 ```
 
-## Tested Commands
+## CI Usage
 
-These commands were run successfully against the current repository:
-
-```bash
-cargo run -- --file examples/query.sql --static-only
-cargo run -- --dir examples --dialect athena --glob "*.sql" --fail-on high
-cargo run -- lineage examples/query.sql
-cargo run -- tables examples/query.sql
-cargo run -- explain examples/query.sql
-cargo run -- analyze examples --glob "*.sql"
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
-```
-
-## Smoke Test Script
-
-For a real provider smoke test with your credentials:
+Fail a build when risky SQL is found:
 
 ```bash
-./scripts/smoke-test.sh openai
-./scripts/smoke-test.sh bedrock
+cargo run -- --dir models --dialect athena --fail-on high
 ```
 
-You can also pass a different SQL file:
+Or subcommand mode:
 
 ```bash
-./scripts/smoke-test.sh openai path/to/query.sql
+cargo run -- analyze models --glob "*.sql"
 ```
 
-## Output Modes
+## Examples Folder
 
-Default mode validates model output against the `SqlExplanation` struct, merges local static findings, and prints a readable summary.
+Ready-to-run examples:
 
-`--json` mode prints the raw model output, useful when troubleshooting schema mismatches.
+- `examples/query.sql`
+- `examples/revenue.sql`
+- `examples/bad_join.sql`
+- `examples/subquery.sql`
+- `examples/silver_proposal_attachments.sql`
+
+## Project Layout
+
+```text
+sql-inspect/
+  Cargo.toml
+  src/
+    main.rs
+    analyzer.rs
+    insights.rs
+    config.rs
+    prompt.rs
+    providers/
+      openai.rs
+      bedrock.rs
+      local.rs
+  examples/
+```
 
 ## Troubleshooting
 
-- `missing required environment variable`: set the reported env var.
-- `Model did not return valid JSON`: run with `--json` and inspect the raw response.
-- `Unexpected ... response shape`: provider returned a different schema; adjust the extractor in:
-  - `src/providers/openai.rs`
-  - `src/providers/bedrock.rs`
-
-## Secret Safety
-
-Local secret files are ignored by git:
-
-- `.env`
-- `.env.*`
-
-Template files are still allowed:
-
-- `.env.example`
-- `.env.sample`
-- `.env.template`
-
-For local scanning, if `gitleaks` is installed:
-
-```bash
-make secrets
-```
-
-## CI And Release
-
-GitHub Actions included in this repo:
-
-- `CI`: runs format, tests, and clippy on pushes/PRs
-- `Audit`: runs `cargo-deny` on pushes/PRs and weekly on Mondays
-- `Secrets`: runs `gitleaks` on pushes/PRs
-- `Release`: builds release binaries for Linux and macOS on `v*` tags and attaches them to a GitHub release
+- missing env vars: set required provider vars
+- unexpected model JSON shape: run with `--json` and inspect response
+- no secrets in repo: `.env` and `.env.*` are gitignored

@@ -1988,7 +1988,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "sql-ai-explainer"
+name = "sql-inspect"
 version = "0.1.0"
 dependencies = [
  "anyhow",

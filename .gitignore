@@ -8,3 +8,6 @@ target/
 !sql-inspect.toml.example
 why-sql-inspect.md
 all-files.md
+examples/silver*
+examples/gold*
+examples/bronze*

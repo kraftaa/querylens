@@ -138,8 +138,7 @@ fn extract_aliases(sql: &str) -> HashMap<String, String> {
                 let candidate = tokens[i + 2];
                 if !matches!(
                     candidate,
-                    "on"
-                        | "using"
+                    "on" | "using"
                         | "where"
                         | "join"
                         | "left"
@@ -236,7 +235,14 @@ fn extract_join_lineage(sql: &str, aliases: &HashMap<String, String>) -> Vec<Str
             let on_start = join_pos + on_rel + 4;
             let rest = &lower[on_start..];
             let mut end = lower.len();
-            for kw in [" join ", " where ", " group by ", " order by ", " limit ", " having "] {
+            for kw in [
+                " join ",
+                " where ",
+                " group by ",
+                " order by ",
+                " limit ",
+                " having ",
+            ] {
                 if let Some(pos) = rest.find(kw) {
                     end = end.min(on_start + pos);
                 }
@@ -253,7 +259,14 @@ fn extract_join_lineage(sql: &str, aliases: &HashMap<String, String>) -> Vec<Str
             let using_start = join_pos + using_rel + 7;
             let rest = &lower[using_start..];
             let mut end = lower.len();
-            for kw in [" join ", " where ", " group by ", " order by ", " limit ", " having "] {
+            for kw in [
+                " join ",
+                " where ",
+                " group by ",
+                " order by ",
+                " limit ",
+                " having ",
+            ] {
                 if let Some(pos) = rest.find(kw) {
                     end = end.min(using_start + pos);
                 }
@@ -393,11 +406,7 @@ fn strip_leading_template_blocks(sql: &str) -> String {
     }
 }
 
-fn resolve_star_select_target(
-    query: &str,
-    ctes: &HashMap<String, String>,
-    depth: usize,
-) -> String {
+fn resolve_star_select_target(query: &str, ctes: &HashMap<String, String>, depth: usize) -> String {
     if depth > 5 {
         return query.to_string();
     }

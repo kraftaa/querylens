@@ -1,3 +1,4 @@
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 
 fn unknown_string() -> String {
@@ -32,8 +33,33 @@ pub struct Finding {
     pub severity: Severity,
     pub message: String,
     pub why_it_matters: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_evidence")]
     pub evidence: Vec<String>,
+}
+
+fn deserialize_evidence<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum EvidenceInput {
+        Single(String),
+        Many(Vec<String>),
+    }
+
+    let value = Option::<EvidenceInput>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(EvidenceInput::Single(s)) => {
+            if s.trim().is_empty() || s == "unknown" {
+                Vec::new()
+            } else {
+                vec![s]
+            }
+        }
+        Some(EvidenceInput::Many(v)) => v,
+        None => Vec::new(),
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -76,11 +102,92 @@ SQL:
 }
 
 pub fn parse_sql_explanation(raw_json: &str) -> anyhow::Result<SqlExplanation> {
-    serde_json::from_str(raw_json).map_err(|e| {
-        anyhow::anyhow!(
-            "Model did not return valid JSON. Try --json to inspect. Error: {e}\nRaw:\n{raw_json}"
-        )
-    })
+    for candidate in parse_candidates(raw_json) {
+        if let Ok(parsed) = serde_json::from_str::<SqlExplanation>(&candidate) {
+            return Ok(parsed);
+        }
+    }
+
+    let parse_err = serde_json::from_str::<SqlExplanation>(raw_json)
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "unknown parse error".to_string());
+
+    Err(anyhow::anyhow!(
+        "Model did not return valid JSON. Try --json to inspect. Error: {parse_err}\nRaw:\n{raw_json}"
+    ))
+}
+
+fn parse_candidates(raw: &str) -> Vec<String> {
+    let mut out = vec![raw.trim().to_string()];
+
+    let trimmed = raw.trim();
+    if trimmed.starts_with("```") {
+        let mut lines = trimmed.lines();
+        let _opening = lines.next();
+        let mut body = Vec::new();
+        for line in lines {
+            if line.trim_start().starts_with("```") {
+                break;
+            }
+            body.push(line);
+        }
+        if !body.is_empty() {
+            out.push(body.join("\n").trim().to_string());
+        }
+    }
+
+    if let Some(json_slice) = first_json_object_slice(trimmed) {
+        out.push(json_slice.trim().to_string());
+    }
+
+    out
+}
+
+fn first_json_object_slice(input: &str) -> Option<&str> {
+    let bytes = input.as_bytes();
+    let mut start = None;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (idx, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match b {
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match b {
+            b'"' => in_string = true,
+            b'{' => {
+                if depth == 0 {
+                    start = Some(idx);
+                }
+                depth += 1;
+            }
+            b'}' => {
+                if depth > 0 {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(s) = start {
+                            return input.get(s..=idx);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -155,5 +262,63 @@ mod tests {
     fn parse_sql_explanation_rejects_invalid_json() {
         let err = parse_sql_explanation("not json").expect_err("invalid JSON should fail");
         assert!(err.to_string().contains("Model did not return valid JSON"));
+    }
+
+    #[test]
+    fn parse_sql_explanation_accepts_fenced_sql_json() {
+        let raw = r#"```sql
+{
+  "summary":"ok",
+  "tables":[],
+  "joins":[],
+  "filters":[],
+  "risks":[],
+  "suggestions":[]
+}
+```"#;
+
+        let parsed = parse_sql_explanation(raw).expect("fenced JSON should parse");
+        assert_eq!(parsed.summary, "ok");
+    }
+
+    #[test]
+    fn parse_sql_explanation_accepts_preamble_plus_json() {
+        let raw = r#"Here is the result:
+{
+  "summary":"ok",
+  "tables":[],
+  "joins":[],
+  "filters":[],
+  "risks":[],
+  "suggestions":[]
+}"#;
+
+        let parsed = parse_sql_explanation(raw).expect("JSON with preamble should parse");
+        assert_eq!(parsed.summary, "ok");
+    }
+
+    #[test]
+    fn parse_sql_explanation_accepts_string_evidence() {
+        let raw = r#"{
+  "summary":"ok",
+  "tables":[],
+  "joins":[],
+  "filters":[],
+  "risks":[],
+  "suggestions":[],
+  "findings":[
+    {
+      "rule_id":"unknown",
+      "severity":"unknown",
+      "message":"has subquery",
+      "why_it_matters":"unknown",
+      "evidence":"unknown"
+    }
+  ]
+}"#;
+
+        let parsed = parse_sql_explanation(raw).expect("string evidence should parse");
+        assert_eq!(parsed.findings.len(), 1);
+        assert!(parsed.findings[0].evidence.is_empty());
     }
 }
