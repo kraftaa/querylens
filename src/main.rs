@@ -904,8 +904,9 @@ fn render_tables(sql: &str) -> String {
 fn render_query_explanation(sql: &str) -> String {
     let explanation = explain_query(sql);
     let mut out = String::new();
-    out.push_str("Purpose: ");
-    out.push_str(&explanation.purpose);
+    out.push_str("Query explanation\n");
+    out.push_str("Meaning: ");
+    out.push_str(&explanation.meaning);
     out.push('\n');
 
     out.push_str("Tables: ");
@@ -916,11 +917,19 @@ fn render_query_explanation(sql: &str) -> String {
     }
     out.push('\n');
 
-    out.push_str("Aggregation: ");
-    if explanation.aggregations.is_empty() {
+    out.push_str("Join: ");
+    if explanation.joins.is_empty() {
         out.push_str("none");
     } else {
-        out.push_str(&explanation.aggregations.join(", "));
+        out.push_str(&explanation.joins.join("; "));
+    }
+    out.push('\n');
+
+    out.push_str("Aggregation: ");
+    if explanation.aggregation_details.is_empty() {
+        out.push_str("none");
+    } else {
+        out.push_str(&explanation.aggregation_details.join(", "));
     }
     out.push('\n');
     out
@@ -2507,9 +2516,13 @@ mod tests {
 
     #[test]
     fn render_query_explanation_contains_purpose() {
-        let output = render_query_explanation("SELECT SUM(amount) AS revenue FROM orders");
-        assert!(output.contains("Purpose:"));
-        assert!(output.contains("Aggregation: SUM"));
+        let output = render_query_explanation(
+            "SELECT customer_id, SUM(amount) AS revenue FROM orders GROUP BY customer_id",
+        );
+        assert!(output.contains("Query explanation"));
+        assert!(output.contains("Meaning: revenue per customer"));
+        assert!(output.contains("Tables: orders"));
+        assert!(output.contains("Aggregation: SUM(amount) AS revenue"));
     }
 
     #[test]

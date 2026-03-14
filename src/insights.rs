@@ -17,7 +17,10 @@ pub struct LineageReport {
 pub struct QueryExplanation {
     pub purpose: String,
     pub tables: Vec<String>,
+    pub joins: Vec<String>,
     pub aggregations: Vec<String>,
+    pub aggregation_details: Vec<String>,
+    pub meaning: String,
 }
 
 pub fn extract_tables(sql: &str) -> Vec<String> {
@@ -93,6 +96,7 @@ fn extract_projection_lineage(sql: &str, aliases: &HashMap<String, String>) -> V
 }
 
 pub fn explain_query(sql: &str) -> QueryExplanation {
+    let report = extract_lineage_report(sql);
     let tables = extract_tables(sql);
     let lower = sql.to_ascii_lowercase();
     let mut aggregations = Vec::new();
@@ -103,6 +107,20 @@ pub fn explain_query(sql: &str) -> QueryExplanation {
         }
     }
 
+    let aggregation_details = report
+        .projections
+        .iter()
+        .filter(|item| contains_aggregate(&item.expression))
+        .map(|item| {
+            if item.output == item.expression {
+                item.expression.clone()
+            } else {
+                format!("{} AS {}", item.expression, item.output)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let meaning = build_meaning(&report.projections, &aggregation_details, &tables);
     let purpose = if !aggregations.is_empty() {
         "calculate aggregate metrics".to_string()
     } else if tables.is_empty() {
@@ -114,7 +132,123 @@ pub fn explain_query(sql: &str) -> QueryExplanation {
     QueryExplanation {
         purpose,
         tables,
+        joins: report.joins,
         aggregations,
+        aggregation_details,
+        meaning,
+    }
+}
+
+fn contains_aggregate(expression: &str) -> bool {
+    let lower = expression.to_ascii_lowercase();
+    ["sum(", "count(", "avg(", "min(", "max("]
+        .iter()
+        .any(|agg| lower.contains(agg))
+}
+
+fn build_meaning(
+    projections: &[LineageItem],
+    aggregation_details: &[String],
+    tables: &[String],
+) -> String {
+    if !aggregation_details.is_empty() {
+        let metric = projections
+            .iter()
+            .find(|item| contains_aggregate(&item.expression))
+            .map(|item| humanize_label(&item.output))
+            .unwrap_or_else(|| "aggregated result".to_string());
+        let dimensions = projections
+            .iter()
+            .filter(|item| !contains_aggregate(&item.expression))
+            .map(describe_dimension)
+            .filter(|label| !label.is_empty())
+            .collect::<Vec<_>>();
+
+        if dimensions.is_empty() {
+            return format!("{metric} total");
+        }
+
+        return format!("{metric} per {}", join_labels(&dimensions));
+    }
+
+    if tables.is_empty() {
+        "query result".to_string()
+    } else {
+        format!("rows from {}", tables.join(", "))
+    }
+}
+
+fn describe_dimension(item: &LineageItem) -> String {
+    let output = humanize_label(&item.output);
+    if output == "id" || output == "email" || output == "date" || output == "created at" {
+        return describe_from_expression(&item.expression).unwrap_or(output);
+    }
+    output
+}
+
+fn describe_from_expression(expression: &str) -> Option<String> {
+    let token = expression
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+        .find(|part| part.contains('.'))?;
+    let (table, column) = token.split_once('.')?;
+    let entity = singularize_label(table);
+    let column_label = humanize_column(column);
+
+    if column_label == "id" {
+        return Some(format!("{entity} id"));
+    }
+    if column_label == "email" {
+        return Some(format!("{entity} email"));
+    }
+    if column_label == "date" || column_label == "created at" {
+        return Some(column_label.to_string());
+    }
+
+    Some(format!("{entity} {column_label}"))
+}
+
+fn singularize_label(label: &str) -> String {
+    let base = label.rsplit('.').next().unwrap_or(label);
+    if let Some(stripped) = base.strip_suffix("ies") {
+        return format!("{stripped}y");
+    }
+    if base.ends_with('s') && base.len() > 1 {
+        return base[..base.len() - 1].to_string();
+    }
+    base.to_string()
+}
+
+fn humanize_column(label: &str) -> String {
+    if label.ends_with("_at") || label.ends_with("_date") {
+        return "date".to_string();
+    }
+    humanize_label(label)
+}
+
+fn humanize_label(label: &str) -> String {
+    let base = label
+        .rsplit('.')
+        .next()
+        .unwrap_or(label)
+        .trim()
+        .trim_matches('"')
+        .trim_matches('`')
+        .trim_matches('\'');
+    let base = base.strip_suffix("_id").unwrap_or(base);
+    base.replace('_', " ")
+}
+
+fn join_labels(labels: &[String]) -> String {
+    match labels {
+        [] => String::new(),
+        [one] => one.clone(),
+        [first, second] => format!("{first} and {second}"),
+        _ => {
+            let mut out = labels[..labels.len() - 1].join(", ");
+            out.push_str(", and ");
+            out.push_str(&labels[labels.len() - 1]);
+            out
+        }
     }
 }
 
@@ -531,11 +665,35 @@ mod tests {
 
     #[test]
     fn explains_query_with_aggregations() {
-        let sql = "SELECT SUM(amount) AS revenue FROM orders";
+        let sql = "SELECT customer_id, SUM(amount) AS revenue FROM orders GROUP BY customer_id";
         let explanation = explain_query(sql);
         assert!(explanation.purpose.contains("aggregate"));
         assert_eq!(explanation.tables, vec!["orders"]);
         assert_eq!(explanation.aggregations, vec!["SUM"]);
+        assert_eq!(
+            explanation.aggregation_details,
+            vec!["SUM(amount) AS revenue"]
+        );
+        assert_eq!(explanation.meaning, "revenue per customer");
+    }
+
+    #[test]
+    fn explains_query_with_join_details() {
+        let sql = "SELECT c.customer_id, SUM(o.amount) AS revenue FROM customers c JOIN orders o ON c.id = o.customer_id GROUP BY c.customer_id";
+        let explanation = explain_query(sql);
+        assert_eq!(explanation.tables, vec!["customers", "orders"]);
+        assert_eq!(explanation.joins, vec!["customers.id = orders.customer_id"]);
+        assert_eq!(explanation.meaning, "revenue per customer");
+    }
+
+    #[test]
+    fn explains_query_with_contextual_dimension_labels() {
+        let sql = "SELECT o.id, o.created_at, c.email, SUM(oi.quantity * oi.unit_price) AS total_amount FROM orders o JOIN customers c ON c.id = o.customer_id JOIN order_items oi ON oi.order_id = o.id GROUP BY o.id, o.created_at, c.email";
+        let explanation = explain_query(sql);
+        assert_eq!(
+            explanation.meaning,
+            "total amount per order id, date, and customer email"
+        );
     }
 
     #[test]

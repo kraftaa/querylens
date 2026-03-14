@@ -63,7 +63,7 @@ cargo build
 |---|---|
 | Static SQL checks | Detect risky patterns (`SELECT *`, possible Cartesian joins, wildcard `LIKE`, etc.) |
 | Column lineage | Trace projection, filter, and join lineage |
-| Query explanation | Summarize purpose, tables, and aggregations |
+| Query explanation | Summarize tables, joins, aggregations, and likely query meaning |
 | Table extraction | List tables used by a query |
 | Folder scanning | Analyze a directory of SQL files |
 | Rule controls | Disable rules or override severity by `rule_id` |
@@ -330,6 +330,22 @@ Example `stats.json`:
     "customers": 200000000000
   }
 }
+```
+
+### Query explanation
+
+```bash
+cargo run -- explain examples/query.sql
+```
+
+Example output:
+
+```text
+Query explanation
+Meaning: total amount per id, created at, email
+Tables: orders, customers, order_items
+Join: customers.id = orders.customer_id; order_items.order_id = orders.id
+Aggregation: SUM(order_items.quantity * order_items.unit_price) AS total_amount
 ```
 
 ### Block dangerous queries
