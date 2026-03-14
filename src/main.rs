@@ -8,7 +8,9 @@ use sql_inspect::providers::bedrock::BedrockProvider;
 use sql_inspect::providers::local::LocalProvider;
 use sql_inspect::providers::openai::OpenAIProvider;
 use sql_inspect::providers::LlmProvider;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 #[derive(ValueEnum, Clone, Debug)]
 enum ProviderArg {
@@ -35,6 +37,21 @@ enum Commands {
     Lineage {
         file: PathBuf,
     },
+    Risk {
+        file: PathBuf,
+    },
+    Guard {
+        file: PathBuf,
+        #[arg(long, value_enum, default_value = "high")]
+        max_risk: SeverityArg,
+        #[arg(long)]
+        deny_rule: Vec<String>,
+    },
+    Simulate {
+        file: PathBuf,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     Tables {
         file: PathBuf,
     },
@@ -45,6 +62,8 @@ enum Commands {
         dir: PathBuf,
         #[arg(long, default_value = "*.sql")]
         glob: String,
+        #[arg(long, default_value_t = false)]
+        changed_only: bool,
     },
 }
 
@@ -69,7 +88,7 @@ struct Args {
     #[arg(long, default_value = "*.sql")]
     glob: String,
 
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, global = true)]
     dialect: Option<DialectArg>,
 
     #[arg(long)]
@@ -81,8 +100,23 @@ struct Args {
     #[arg(long, value_enum)]
     fail_on: Option<SeverityArg>,
 
-    #[arg(long)]
+    #[arg(long, global = true)]
     json: bool,
+
+    #[arg(long, global = true, conflicts_with = "scan_tb")]
+    scan_bytes: Option<u64>,
+
+    #[arg(long, global = true, conflicts_with = "scan_bytes")]
+    scan_tb: Option<f64>,
+
+    #[arg(long, global = true)]
+    athena_query_execution_id: Option<String>,
+
+    #[arg(long, global = true)]
+    athena_region: Option<String>,
+
+    #[arg(long, global = true)]
+    stats_file: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -99,6 +133,14 @@ struct FileReport {
     estimated_cost_impact: String,
     findings: Vec<Finding>,
     suggestions: Vec<String>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct RiskReport {
+    file: String,
+    risk_score: String,
+    reasons: Vec<String>,
+    estimated_scan: String,
 }
 
 fn env(name: &'static str) -> Result<String, AppError> {
@@ -216,6 +258,52 @@ fn merge_static_analysis(parsed: &mut SqlExplanation, analysis: &StaticAnalysis)
 
     if parsed.confidence == "unknown" && !analysis.findings.is_empty() {
         parsed.confidence = "medium".to_string();
+    }
+}
+
+fn extract_suppressed_rules(sql: &str) -> HashSet<String> {
+    let mut suppressed = HashSet::new();
+    for line in sql.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(idx) = lower.find("sql-inspect: disable=") else {
+            continue;
+        };
+        let raw = &line[idx + "sql-inspect: disable=".len()..];
+        let raw = raw
+            .split("*/")
+            .next()
+            .unwrap_or(raw)
+            .split("--")
+            .next()
+            .unwrap_or(raw);
+        for part in raw.split(',') {
+            let token = part
+                .trim()
+                .trim_matches(|c: char| c == '*' || c == '/' || c == ';')
+                .to_ascii_uppercase();
+            if !token.is_empty() {
+                suppressed.insert(token);
+            }
+        }
+    }
+    suppressed
+}
+
+fn apply_inline_suppressions_to_analysis(analysis: &mut StaticAnalysis, sql: &str) {
+    let suppressed = extract_suppressed_rules(sql);
+    if suppressed.is_empty() {
+        return;
+    }
+    let mut removed_messages = Vec::new();
+    analysis.findings.retain(|f| {
+        let keep = !suppressed.contains(&f.rule_id.to_ascii_uppercase());
+        if !keep {
+            removed_messages.push(f.message.clone());
+        }
+        keep
+    });
+    for message in removed_messages {
+        analysis.anti_patterns.retain(|item| item != &message);
     }
 }
 
@@ -438,7 +526,8 @@ async fn analyze_single_sql(
     args: &Args,
     options: AnalysisOptions,
 ) -> anyhow::Result<SqlExplanation> {
-    let analysis = analyze_sql(sql, options);
+    let mut analysis = analyze_sql(sql, options);
+    apply_inline_suppressions_to_analysis(&mut analysis, sql);
 
     if static_only {
         return Ok(build_static_explanation(&analysis));
@@ -456,6 +545,79 @@ fn collect_sql_files(root: &Path, pattern: &str) -> anyhow::Result<Vec<PathBuf>>
     let mut files = Vec::new();
     collect_sql_files_recursive(root, pattern, &mut files)?;
     files.sort();
+    Ok(files)
+}
+
+fn collect_changed_sql_files(root: &Path, pattern: &str) -> anyhow::Result<Vec<PathBuf>> {
+    let tracked_worktree = ProcessCommand::new("git")
+        .arg("diff")
+        .arg("--name-only")
+        .arg("--diff-filter=ACMRTUXB")
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run git diff for changed-only mode: {e}"))?;
+
+    if !tracked_worktree.status.success() {
+        return Err(anyhow::anyhow!(
+            "git diff failed for changed-only mode: {}",
+            String::from_utf8_lossy(&tracked_worktree.stderr).trim()
+        ));
+    }
+
+    let tracked_staged = ProcessCommand::new("git")
+        .arg("diff")
+        .arg("--cached")
+        .arg("--name-only")
+        .arg("--diff-filter=ACMRTUXB")
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!("failed to run git diff --cached for changed-only mode: {e}")
+        })?;
+
+    if !tracked_staged.status.success() {
+        return Err(anyhow::anyhow!(
+            "git diff --cached failed for changed-only mode: {}",
+            String::from_utf8_lossy(&tracked_staged.stderr).trim()
+        ));
+    }
+
+    let untracked = ProcessCommand::new("git")
+        .arg("ls-files")
+        .arg("--others")
+        .arg("--exclude-standard")
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run git ls-files for changed-only mode: {e}"))?;
+
+    if !untracked.status.success() {
+        return Err(anyhow::anyhow!(
+            "git ls-files failed for changed-only mode: {}",
+            String::from_utf8_lossy(&untracked.stderr).trim()
+        ));
+    }
+
+    let mut files = Vec::new();
+    let cwd = std::env::current_dir()?;
+    let root_abs = if root.is_absolute() {
+        root.to_path_buf()
+    } else {
+        cwd.join(root)
+    };
+    for output in [
+        &tracked_worktree.stdout,
+        &tracked_staged.stdout,
+        &untracked.stdout,
+    ] {
+        for line in String::from_utf8_lossy(output).lines() {
+            let candidate = cwd.join(line);
+            if !candidate.starts_with(&root_abs) {
+                continue;
+            }
+            if candidate.is_file() && matches_pattern(&candidate, pattern) {
+                files.push(candidate);
+            }
+        }
+    }
+    files.sort();
+    files.dedup();
     Ok(files)
 }
 
@@ -576,6 +738,288 @@ fn render_query_explanation(sql: &str) -> String {
     out
 }
 
+fn risk_score(findings: &[Finding]) -> &'static str {
+    match max_finding_severity(findings) {
+        Severity::High => "HIGH",
+        Severity::Medium => "MEDIUM",
+        Severity::Low => "LOW",
+        Severity::Unknown => "LOW",
+    }
+}
+
+fn estimated_scan_label(args: &Args, sql: Option<&str>) -> anyhow::Result<String> {
+    if let Some(tb) = args.scan_tb {
+        return Ok(format!("{tb:.2} TB"));
+    }
+    if let Some(bytes) = args.scan_bytes {
+        let tb = bytes as f64 / 1_000_000_000_000_f64;
+        return Ok(format!("{tb:.2} TB"));
+    }
+    if let Some(bytes) = fetch_athena_scanned_bytes(args)? {
+        let tb = bytes as f64 / 1_000_000_000_000_f64;
+        return Ok(format!("{tb:.2} TB"));
+    }
+    if let Some(bytes) = estimate_scan_from_stats_file(args, sql)? {
+        let tb = bytes as f64 / 1_000_000_000_000_f64;
+        return Ok(format!("{tb:.2} TB"));
+    }
+    Ok("unknown".to_string())
+}
+
+fn fetch_athena_scanned_bytes(args: &Args) -> anyhow::Result<Option<u64>> {
+    let Some(execution_id) = args.athena_query_execution_id.as_deref() else {
+        return Ok(None);
+    };
+
+    let mut cmd = ProcessCommand::new("aws");
+    cmd.arg("athena")
+        .arg("get-query-execution")
+        .arg("--query-execution-id")
+        .arg(execution_id)
+        .arg("--output")
+        .arg("json");
+
+    if let Some(region) = args.athena_region.as_deref() {
+        cmd.arg("--region").arg(region);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to execute aws cli for Athena lookup: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!(
+            "aws athena get-query-execution failed for {}: {}",
+            execution_id,
+            stderr.trim()
+        ));
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| {
+        anyhow::anyhow!("failed to parse Athena get-query-execution output as JSON: {e}")
+    })?;
+
+    let scanned = value["QueryExecution"]["Statistics"]["DataScannedInBytes"]
+        .as_u64()
+        .or_else(|| {
+            value["QueryExecution"]["Statistics"]["DataScannedInBytes"]
+                .as_str()
+                .and_then(|s| s.parse::<u64>().ok())
+        });
+
+    Ok(scanned)
+}
+
+fn estimate_scan_from_stats_file(args: &Args, sql: Option<&str>) -> anyhow::Result<Option<u64>> {
+    let (Some(path), Some(sql)) = (args.stats_file.as_ref(), sql) else {
+        return Ok(None);
+    };
+
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("failed to read stats file {}: {e}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        anyhow::anyhow!("failed to parse stats file {} as JSON: {e}", path.display())
+    })?;
+
+    let tables = extract_tables(sql);
+    if tables.is_empty() {
+        return Ok(None);
+    }
+
+    let mut total = 0_u64;
+    let mut matched = false;
+    for table in tables {
+        if let Some(bytes) = lookup_table_bytes(&value, &table) {
+            total = total.saturating_add(bytes);
+            matched = true;
+        }
+    }
+
+    if matched {
+        Ok(Some(total))
+    } else {
+        Ok(None)
+    }
+}
+
+fn lookup_table_bytes(value: &serde_json::Value, table: &str) -> Option<u64> {
+    let direct = value.get(table).and_then(parse_bytes_value);
+    if direct.is_some() {
+        return direct;
+    }
+    value
+        .get("tables")
+        .and_then(|v| v.get(table))
+        .and_then(parse_bytes_value)
+}
+
+fn parse_bytes_value(value: &serde_json::Value) -> Option<u64> {
+    if let Some(n) = value.as_u64() {
+        return Some(n);
+    }
+    if let Some(s) = value.as_str() {
+        return s.parse::<u64>().ok();
+    }
+    value.get("bytes").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+    })
+}
+
+fn guard_block_reasons(
+    findings: &[Finding],
+    max_risk: Severity,
+    deny_rules: &[String],
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    let worst = max_finding_severity(findings);
+    if worst.rank() > max_risk.rank() && max_risk != Severity::Unknown {
+        reasons.push(format!(
+            "maximum risk threshold exceeded (worst={}, threshold={})",
+            severity_label(&worst),
+            severity_label(&max_risk)
+        ));
+    }
+
+    let deny_rules_upper: HashSet<String> =
+        deny_rules.iter().map(|r| r.to_ascii_uppercase()).collect();
+    for finding in findings {
+        if deny_rules_upper.contains(&finding.rule_id.to_ascii_uppercase()) {
+            reasons.push(format!(
+                "deny-rule matched {} ({})",
+                finding.rule_id, finding.message
+            ));
+        }
+    }
+
+    reasons
+}
+
+fn simulate_query(sql: &str, limit: usize) -> String {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let normalized = strip_sql_comments(trimmed).to_ascii_lowercase();
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
+    if has_limit_clause(&tokens) {
+        return format!("{trimmed};");
+    }
+
+    if normalized.starts_with("select ") || normalized.starts_with("with ") {
+        return format!("{trimmed}\nLIMIT {limit};");
+    }
+
+    format!("SELECT *\nFROM (\n{trimmed}\n) AS sql_inspect_preview\nLIMIT {limit};")
+}
+
+fn strip_sql_comments(sql: &str) -> String {
+    let mut out = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some(c) = chars.next() {
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                out.push('\n');
+            }
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && matches!(chars.peek(), Some('/')) {
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if c == '-' && matches!(chars.peek(), Some('-')) {
+            chars.next();
+            in_line_comment = true;
+            continue;
+        }
+        if c == '/' && matches!(chars.peek(), Some('*')) {
+            chars.next();
+            in_block_comment = true;
+            continue;
+        }
+        out.push(c);
+    }
+
+    out
+}
+
+fn has_limit_clause(tokens: &[&str]) -> bool {
+    for (idx, token) in tokens.iter().enumerate() {
+        if *token != "limit" {
+            continue;
+        }
+        if let Some(next) = tokens.get(idx + 1) {
+            let next = next.trim_matches(|c: char| c == ',' || c == ';' || c == ')');
+            if next == "all"
+                || next == "?"
+                || next.starts_with(':')
+                || next.starts_with('$')
+                || next.chars().next().is_some_and(|c| c.is_ascii_digit())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn build_effective_static_explanation(
+    sql: &str,
+    options: AnalysisOptions,
+    config: &SqlInspectConfig,
+) -> SqlExplanation {
+    let mut analysis = analyze_sql(sql, options);
+    apply_inline_suppressions_to_analysis(&mut analysis, sql);
+    let mut parsed = build_static_explanation(&analysis);
+    apply_rule_controls(&mut parsed, config);
+    parsed
+}
+
+fn build_risk_report(path: &Path, findings: &[Finding], estimated_scan: String) -> RiskReport {
+    let mut reasons = Vec::new();
+    for finding in findings {
+        reasons.push(format!(
+            "{}: {}",
+            finding.rule_id.replace('_', " ").to_lowercase(),
+            finding.message
+        ));
+    }
+
+    if reasons.is_empty() {
+        reasons.push("No high-confidence anti-patterns detected by static rules".to_string());
+    }
+
+    RiskReport {
+        file: path.display().to_string(),
+        risk_score: risk_score(findings).to_string(),
+        reasons,
+        estimated_scan,
+    }
+}
+
+fn render_risk_report(report: &RiskReport) -> String {
+    let mut out = String::new();
+    out.push_str(&report.file);
+    out.push('\n');
+    out.push_str("Risk score: ");
+    out.push_str(&report.risk_score);
+    out.push_str("\n\nReasons:\n");
+    for reason in &report.reasons {
+        out.push_str("- ");
+        out.push_str(reason);
+        out.push('\n');
+    }
+    out.push_str("\nEstimated scan: ");
+    out.push_str(&report.estimated_scan);
+    out.push('\n');
+    out
+}
+
 fn render_folder_summary(
     file_count: usize,
     counts: &std::collections::BTreeMap<String, usize>,
@@ -605,6 +1049,70 @@ async fn main() -> Result<(), anyhow::Error> {
                 print!("{}", render_lineage(file, &sql));
                 return Ok(());
             }
+            Commands::Risk { file } => {
+                let sql = read_sql_file(file)?;
+                let mut options = analysis_options(&config);
+                if let Some(dialect) = args.dialect {
+                    options.dialect = cli_dialect(dialect);
+                }
+                let parsed = build_effective_static_explanation(&sql, options, &config);
+                let report = build_risk_report(
+                    file,
+                    &parsed.findings,
+                    estimated_scan_label(&args, Some(&sql))?,
+                );
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", render_risk_report(&report));
+                }
+                return Ok(());
+            }
+            Commands::Guard {
+                file,
+                max_risk,
+                deny_rule,
+            } => {
+                let sql = read_sql_file(file)?;
+                let mut options = analysis_options(&config);
+                if let Some(dialect) = args.dialect {
+                    options.dialect = cli_dialect(dialect);
+                }
+                let parsed = build_effective_static_explanation(&sql, options, &config);
+                let block_reasons =
+                    guard_block_reasons(&parsed.findings, to_severity(*max_risk), deny_rule);
+
+                if args.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "file": file.display().to_string(),
+                            "blocked": !block_reasons.is_empty(),
+                            "risk_score": risk_score(&parsed.findings),
+                            "reasons": block_reasons,
+                            "findings": parsed.findings
+                        }))?
+                    );
+                } else if block_reasons.is_empty() {
+                    println!("ALLOW {}", file.display());
+                } else {
+                    println!("BLOCK {}", file.display());
+                    for reason in &block_reasons {
+                        println!("- {reason}");
+                    }
+                }
+
+                if !block_reasons.is_empty() {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Commands::Simulate { file, limit } => {
+                let sql = read_sql_file(file)?;
+                let simulated = simulate_query(&sql, *limit);
+                println!("{simulated}");
+                return Ok(());
+            }
             Commands::Tables { file } => {
                 let sql = read_sql_file(file)?;
                 print!("{}", render_tables(&sql));
@@ -615,17 +1123,26 @@ async fn main() -> Result<(), anyhow::Error> {
                 print!("{}", render_query_explanation(&sql));
                 return Ok(());
             }
-            Commands::Analyze { dir, glob } => {
+            Commands::Analyze {
+                dir,
+                glob,
+                changed_only,
+            } => {
                 let mut options = analysis_options(&config);
                 if let Some(dialect) = args.dialect {
                     options.dialect = cli_dialect(dialect);
                 }
-                let files = collect_sql_files(dir, glob)?;
+                let files = if *changed_only {
+                    collect_changed_sql_files(dir, glob)?
+                } else {
+                    collect_sql_files(dir, glob)?
+                };
                 let mut counts = std::collections::BTreeMap::<String, usize>::new();
 
                 for file in &files {
                     let sql = std::fs::read_to_string(file)?;
-                    let analysis = analyze_sql(&sql, options);
+                    let mut analysis = analyze_sql(&sql, options);
+                    apply_inline_suppressions_to_analysis(&mut analysis, &sql);
                     let mut parsed = build_static_explanation(&analysis);
                     apply_rule_controls(&mut parsed, &config);
                     for finding in &parsed.findings {
@@ -728,9 +1245,11 @@ async fn main() -> Result<(), anyhow::Error> {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_rule_controls, collect_sql_files, matches_pattern, merge_static_analysis, read_input,
-        render_explanation, render_query_explanation, render_tables, should_fail, Args, Commands,
-        DialectArg, InputMode, ProviderArg, SeverityArg,
+        apply_inline_suppressions_to_analysis, apply_rule_controls, collect_sql_files,
+        extract_suppressed_rules, guard_block_reasons, matches_pattern, merge_static_analysis,
+        read_input, render_explanation, render_query_explanation, render_tables, risk_score,
+        should_fail, simulate_query, Args, Commands, DialectArg, InputMode, ProviderArg,
+        SeverityArg,
     };
     use clap::Parser;
     use sql_inspect::analyzer::{analyze_sql, AnalysisOptions};
@@ -759,6 +1278,55 @@ mod tests {
     }
 
     #[test]
+    fn args_parse_risk_subcommand() {
+        let args = Args::try_parse_from(["sql-inspect", "risk", "examples/query.sql"])
+            .expect("subcommand args should parse");
+        assert!(matches!(args.command, Some(Commands::Risk { .. })));
+    }
+
+    #[test]
+    fn args_parse_guard_subcommand() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "guard",
+            "examples/query.sql",
+            "--max-risk",
+            "medium",
+            "--deny-rule",
+            "CROSS_JOIN",
+        ])
+        .expect("guard args should parse");
+        assert!(matches!(args.command, Some(Commands::Guard { .. })));
+    }
+
+    #[test]
+    fn args_parse_simulate_subcommand() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "simulate",
+            "examples/query.sql",
+            "--limit",
+            "50",
+        ])
+        .expect("simulate args should parse");
+        assert!(matches!(args.command, Some(Commands::Simulate { .. })));
+    }
+
+    #[test]
+    fn args_parse_risk_with_scan_tb() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "risk",
+            "examples/query.sql",
+            "--scan-tb",
+            "2.3",
+        ])
+        .expect("risk args with scan tb should parse");
+        assert_eq!(args.scan_tb, Some(2.3));
+        assert_eq!(args.scan_bytes, None);
+    }
+
+    #[test]
     fn args_parse_dir_and_fail_threshold() {
         let args = Args::try_parse_from([
             "sql-inspect",
@@ -779,6 +1347,26 @@ mod tests {
     }
 
     #[test]
+    fn args_parse_analyze_changed_only() {
+        let args = Args::try_parse_from([
+            "sql-inspect",
+            "analyze",
+            "examples",
+            "--glob",
+            "*.sql",
+            "--changed-only",
+        ])
+        .expect("args should parse");
+        assert!(matches!(
+            args.command,
+            Some(Commands::Analyze {
+                changed_only: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn read_input_accepts_inline_sql() {
         let args = Args {
             command: None,
@@ -792,6 +1380,11 @@ mod tests {
             static_only: false,
             fail_on: None,
             json: false,
+            scan_bytes: None,
+            scan_tb: None,
+            athena_query_execution_id: None,
+            athena_region: None,
+            stats_file: None,
         };
 
         let input = read_input(&args).expect("inline SQL should be accepted");
@@ -812,6 +1405,11 @@ mod tests {
             static_only: false,
             fail_on: None,
             json: false,
+            scan_bytes: None,
+            scan_tb: None,
+            athena_query_execution_id: None,
+            athena_region: None,
+            stats_file: None,
         };
 
         let input = read_input(&args).expect("file input should be accepted");
@@ -835,6 +1433,11 @@ mod tests {
             static_only: false,
             fail_on: None,
             json: false,
+            scan_bytes: None,
+            scan_tb: None,
+            athena_query_execution_id: None,
+            athena_region: None,
+            stats_file: None,
         };
 
         let input = read_input(&args).expect("dir input should be accepted");
@@ -855,6 +1458,11 @@ mod tests {
             static_only: false,
             fail_on: None,
             json: false,
+            scan_bytes: None,
+            scan_tb: None,
+            athena_query_execution_id: None,
+            athena_region: None,
+            stats_file: None,
         };
 
         let err = read_input(&args).expect_err("missing input should fail");
@@ -928,7 +1536,7 @@ mod tests {
 
         assert!(parsed.anti_patterns.iter().any(|x| x == "SELECT *"));
         assert!(parsed.findings.iter().any(|x| x.rule_id == "SELECT_STAR"));
-        assert_eq!(parsed.estimated_cost_impact, "medium");
+        assert_eq!(parsed.estimated_cost_impact, "high");
         assert_eq!(parsed.confidence, "medium");
     }
 
@@ -970,6 +1578,153 @@ mod tests {
         assert!(should_fail(&findings, Some(Severity::Medium)));
         assert!(should_fail(&findings, Some(Severity::High)));
         assert!(!should_fail(&[], Some(Severity::Low)));
+    }
+
+    #[test]
+    fn risk_score_uses_max_severity() {
+        let findings = vec![
+            Finding {
+                rule_id: "IN_SUBQUERY".to_string(),
+                severity: Severity::Low,
+                message: "IN (SELECT ...)".to_string(),
+                why_it_matters: "might be less efficient".to_string(),
+                evidence: vec![],
+            },
+            Finding {
+                rule_id: "SELECT_STAR".to_string(),
+                severity: Severity::High,
+                message: "SELECT *".to_string(),
+                why_it_matters: "can scan too much".to_string(),
+                evidence: vec![],
+            },
+        ];
+        assert_eq!(risk_score(&findings), "HIGH");
+    }
+
+    #[test]
+    fn estimated_scan_label_prefers_tb() {
+        let args = Args {
+            command: None,
+            provider: ProviderArg::Openai,
+            sql: None,
+            file: None,
+            dir: None,
+            glob: "*.sql".to_string(),
+            dialect: None,
+            config: None,
+            static_only: false,
+            fail_on: None,
+            json: false,
+            scan_bytes: Some(1_500_000_000_000),
+            scan_tb: Some(2.3),
+            athena_query_execution_id: None,
+            athena_region: None,
+            stats_file: None,
+        };
+        assert_eq!(
+            super::estimated_scan_label(&args, Some("SELECT * FROM orders")).expect("label"),
+            "2.30 TB"
+        );
+    }
+
+    #[test]
+    fn estimated_scan_label_can_use_stats_file() {
+        let dir = temp_test_dir("stats-file");
+        let path = dir.join("stats.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "tables": {
+    "orders": { "bytes": 1000000000000 },
+    "customers": 200000000000
+  }
+}"#,
+        )
+        .expect("write stats");
+
+        let args = Args {
+            command: None,
+            provider: ProviderArg::Openai,
+            sql: None,
+            file: None,
+            dir: None,
+            glob: "*.sql".to_string(),
+            dialect: None,
+            config: None,
+            static_only: false,
+            fail_on: None,
+            json: false,
+            scan_bytes: None,
+            scan_tb: None,
+            athena_query_execution_id: None,
+            athena_region: None,
+            stats_file: Some(path.clone()),
+        };
+
+        let label = super::estimated_scan_label(
+            &args,
+            Some("SELECT * FROM orders o JOIN customers c ON o.customer_id = c.id"),
+        )
+        .expect("label");
+        assert_eq!(label, "1.20 TB");
+
+        std::fs::remove_file(path).expect("cleanup file");
+        std::fs::remove_dir_all(dir).expect("cleanup dir");
+    }
+
+    #[test]
+    fn simulate_query_appends_limit_for_select_queries() {
+        let sql = "SELECT id FROM orders";
+        let simulated = simulate_query(sql, 25);
+        assert!(simulated.contains("LIMIT 25;"));
+    }
+
+    #[test]
+    fn simulate_query_ignores_limit_word_in_comment() {
+        let sql = "-- limit 1\nSELECT id FROM orders";
+        let simulated = simulate_query(sql, 25);
+        assert!(simulated.contains("LIMIT 25;"));
+    }
+
+    #[test]
+    fn simulate_query_does_not_treat_alias_as_limit_clause() {
+        let sql = "SELECT total AS limit FROM orders";
+        let simulated = simulate_query(sql, 25);
+        assert!(simulated.contains("LIMIT 25;"));
+    }
+
+    #[test]
+    fn extracts_suppressed_rules_from_comment() {
+        let sql = "-- sql-inspect: disable=SELECT_STAR, MISSING_WHERE\nSELECT * FROM orders";
+        let rules = extract_suppressed_rules(sql);
+        assert!(rules.contains("SELECT_STAR"));
+        assert!(rules.contains("MISSING_WHERE"));
+    }
+
+    #[test]
+    fn inline_suppression_removes_matching_findings() {
+        let sql = "-- sql-inspect: disable=SELECT_STAR\nSELECT * FROM orders";
+        let mut analysis = analyze_sql(sql, AnalysisOptions::default());
+        apply_inline_suppressions_to_analysis(&mut analysis, sql);
+        assert!(!analysis.findings.iter().any(|f| f.rule_id == "SELECT_STAR"));
+        assert!(!analysis.anti_patterns.iter().any(|p| p == "SELECT *"));
+    }
+
+    #[test]
+    fn guard_threshold_blocks_only_above_max_risk() {
+        let findings = vec![Finding {
+            rule_id: "SELECT_STAR".to_string(),
+            severity: Severity::High,
+            message: "SELECT *".to_string(),
+            why_it_matters: "bad".to_string(),
+            evidence: vec![],
+        }];
+
+        let reasons = guard_block_reasons(&findings, Severity::High, &[]);
+        assert!(reasons.is_empty());
+
+        let reasons = guard_block_reasons(&findings, Severity::Medium, &[]);
+        assert!(!reasons.is_empty());
     }
 
     #[test]

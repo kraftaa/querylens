@@ -147,9 +147,67 @@ brew install kraftaa/tap/sql-inspect
 
 ```bash
 cargo run -- lineage <file.sql>
+cargo run -- risk <file.sql>
+cargo run -- guard <file.sql> --max-risk high --deny-rule CROSS_JOIN
+cargo run -- simulate <file.sql> --limit 100
 cargo run -- tables <file.sql>
 cargo run -- explain <file.sql>
 cargo run -- analyze <dir> --glob "*.sql"
+cargo run -- analyze <dir> --glob "*.sql" --changed-only
+```
+
+### Query Risk Scanner
+
+```bash
+cargo run -- risk examples/bad_join.sql
+cargo run -- risk examples/bad_join.sql --scan-tb 2.3
+cargo run -- risk examples/bad_join.sql --scan-bytes 2300000000000
+```
+
+Example output:
+
+```text
+examples/bad_join.sql
+Risk score: HIGH
+
+Reasons:
+- select star: SELECT *
+- missing where: No WHERE clause
+
+Estimated scan: 2.30 TB
+```
+
+Use one of:
+
+- `--scan-tb <value>` for TB units directly
+- `--scan-bytes <value>` to auto-convert bytes to TB
+- `--athena-query-execution-id <id>` to fetch `DataScannedInBytes` from Athena via `aws` CLI
+- `--athena-region <region>` optional region override for Athena lookup
+- `--stats-file <path.json>` to estimate scan bytes from table-level stats
+
+Example `stats.json`:
+
+```json
+{
+  "tables": {
+    "orders": { "bytes": 1000000000000 },
+    "customers": 200000000000
+  }
+}
+```
+
+### Block dangerous queries
+
+```bash
+cargo run -- guard examples/bad_join.sql --max-risk high --deny-rule CROSS_JOIN --deny-rule FULL_TABLE_SCAN_LIKELY
+```
+
+Exit code is `1` when blocked, so this works directly in CI.
+
+### Simulate safer preview query
+
+```bash
+cargo run -- simulate examples/query.sql --limit 100
 ```
 
 ### Main Analyze Command (LLM + static)
@@ -241,7 +299,19 @@ Or subcommand mode:
 
 ```bash
 cargo run -- analyze models --glob "*.sql"
+cargo run -- analyze models --glob "*.sql" --changed-only
 ```
+
+### Inline rule suppression
+
+Add suppression comments directly in SQL when needed:
+
+```sql
+-- sql-inspect: disable=SELECT_STAR,MISSING_WHERE
+SELECT * FROM some_small_reference_table
+```
+
+Suppression applies to matching `rule_id` values for that file.
 
 ## Examples Folder
 

@@ -115,6 +115,24 @@ pub fn analyze_sql(sql: &str, options: AnalysisOptions) -> StaticAnalysis {
         score += 2;
     }
 
+    if has_likely_full_scan_pattern(&normalized, &tokens) {
+        findings.push(Finding {
+            rule_id: "FULL_TABLE_SCAN_LIKELY".to_string(),
+            severity: Severity::High,
+            message: "Likely full table scan".to_string(),
+            why_it_matters:
+                "This query shape is likely to scan most rows and can materially increase cost"
+                    .to_string(),
+            evidence: vec!["No selective WHERE/partition pruning detected".to_string()],
+        });
+        risks.push("Likely full table scan due to missing selective filters".to_string());
+        suggestions.push(
+            "Add selective predicates (or partition filters in Athena) before running at scale"
+                .to_string(),
+        );
+        score += 2;
+    }
+
     if options.suggest_limit_for_exploratory
         && looks_exploratory_select(&tokens, join_count)
         && !tokens.contains(&"limit")
@@ -282,6 +300,15 @@ fn has_obvious_athena_partition_filter(normalized: &str) -> bool {
     PARTITION_HINTS.iter().any(|hint| normalized.contains(hint))
 }
 
+fn has_likely_full_scan_pattern(normalized: &str, tokens: &[&str]) -> bool {
+    let has_from = tokens.contains(&"from");
+    let has_where = tokens.contains(&"where");
+    let has_limit = tokens.contains(&"limit");
+    let has_join = normalized.contains(" join ");
+    let has_select_star = normalized.contains("select *");
+    has_from && !has_where && !has_limit && (has_select_star || has_join)
+}
+
 #[cfg(test)]
 mod tests {
     use super::analyze_sql;
@@ -432,5 +459,15 @@ mod tests {
         let sql = "SELECT id FROM orders WHERE customer_id IN (SELECT id FROM customers)";
         let analysis = analyze_sql(sql, AnalysisOptions::default());
         assert!(analysis.findings.iter().any(|f| f.rule_id == "IN_SUBQUERY"));
+    }
+
+    #[test]
+    fn detects_likely_full_table_scan() {
+        let sql = "SELECT * FROM events";
+        let analysis = analyze_sql(sql, AnalysisOptions::default());
+        assert!(analysis
+            .findings
+            .iter()
+            .any(|f| f.rule_id == "FULL_TABLE_SCAN_LIKELY"));
     }
 }
