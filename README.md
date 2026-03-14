@@ -180,6 +180,7 @@ cargo run -- analyze <dir> --glob "*.sql" --top 10 --verbose
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql"
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --ci
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --markdown
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --cost-diff --stats-file stats.json
 ```
 
 ### PR review mode
@@ -236,6 +237,35 @@ Markdown mode for PR comments:
 
 ```bash
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --markdown
+```
+
+Cost regression mode:
+
+```bash
+cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --cost-diff --stats-file stats.json
+```
+
+Example output:
+
+```text
+SQL Cost Regression
+
+1 changed SQL file
+
+File: models/revenue.sql
+
+Estimated scan change:
+Before: 22 GB
+After: 1.40 TB
+Increase: 63.6x
+
+Cost regression: HIGH
+
+Reason:
+Filter removed: orders.order_date >= DATE '2026-01-01'
+
+Recommendation:
+Restore a selective WHERE or partition predicate.
 ```
 
 ### Repo scan summary

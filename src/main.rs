@@ -88,6 +88,8 @@ enum Commands {
         ci: bool,
         #[arg(long, default_value_t = false, conflicts_with = "ci")]
         markdown: bool,
+        #[arg(long, default_value_t = false, conflicts_with_all = ["ci", "markdown"])]
+        cost_diff: bool,
     },
 }
 
@@ -217,6 +219,10 @@ struct PrFileDelta {
     estimated_scan_from: String,
     estimated_scan_to: String,
     scan_delta: String,
+    cost_regression: Option<String>,
+    cost_regression_reason: Option<String>,
+    cost_recommendation: Option<String>,
+    scan_increase_factor: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1327,6 +1333,22 @@ fn bytes_to_tb_label(bytes: Option<u64>) -> String {
     }
 }
 
+fn bytes_to_human_label(bytes: Option<u64>) -> String {
+    match bytes {
+        Some(bytes) if bytes >= 1_000_000_000_000 => {
+            format!("{:.2} TB", bytes as f64 / 1_000_000_000_000_f64)
+        }
+        Some(bytes) if bytes >= 1_000_000_000 => {
+            format!("{:.0} GB", bytes as f64 / 1_000_000_000_f64)
+        }
+        Some(bytes) if bytes >= 1_000_000 => {
+            format!("{:.0} MB", bytes as f64 / 1_000_000_f64)
+        }
+        Some(bytes) => format!("{bytes} B"),
+        None => "unknown".to_string(),
+    }
+}
+
 fn estimate_scan_bytes(args: &Args, sql: &str) -> anyhow::Result<Option<u64>> {
     if let Some(tb) = args.scan_tb {
         return Ok(Some((tb * 1_000_000_000_000_f64) as u64));
@@ -1362,6 +1384,78 @@ fn scan_delta_label(from: Option<u64>, to: Option<u64>) -> String {
         (Some(_), Some(_)) => "0.00 TB".to_string(),
         _ => "unknown".to_string(),
     }
+}
+
+fn scan_increase_factor_label(from: Option<u64>, to: Option<u64>) -> Option<String> {
+    match (from, to) {
+        (Some(from), Some(to)) if from > 0 && to > from => {
+            Some(format!("{:.1}x", to as f64 / from as f64))
+        }
+        _ => None,
+    }
+}
+
+fn cost_regression_level(from: Option<u64>, to: Option<u64>) -> Option<String> {
+    let factor = match (from, to) {
+        (Some(from), Some(to)) if from > 0 && to > from => to as f64 / from as f64,
+        _ => return None,
+    };
+
+    let level = if factor >= 10.0 {
+        "HIGH"
+    } else if factor >= 3.0 {
+        "MEDIUM"
+    } else {
+        "LOW"
+    };
+
+    Some(level.to_string())
+}
+
+fn first_filter(sql: &str) -> Option<String> {
+    extract_lineage_report(sql).filters.into_iter().next()
+}
+
+fn derive_cost_regression_reason(
+    prev_sql: Option<&str>,
+    curr_sql: &str,
+    prev_findings: &[Finding],
+    curr_findings: &[Finding],
+) -> (Option<String>, Option<String>) {
+    let prev_filter = prev_sql.and_then(first_filter);
+    let curr_filter = first_filter(curr_sql);
+
+    if prev_filter.is_some() && curr_filter.is_none() {
+        let removed = prev_filter.unwrap_or_default();
+        return (
+            Some(format!("Filter removed: {removed}")),
+            Some("Restore a selective WHERE or partition predicate.".to_string()),
+        );
+    }
+
+    if !has_rule(prev_findings, "ATHENA_MISSING_PARTITION_FILTER")
+        && has_rule(curr_findings, "ATHENA_MISSING_PARTITION_FILTER")
+    {
+        let table = extract_tables(curr_sql)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "query".to_string());
+        return (
+            Some(format!("Partition filter removed or missing on {table}")),
+            Some("Restore a partition predicate on the scanned table.".to_string()),
+        );
+    }
+
+    if !has_rule(prev_findings, "FULL_TABLE_SCAN_LIKELY")
+        && has_rule(curr_findings, "FULL_TABLE_SCAN_LIKELY")
+    {
+        return (
+            Some("Query is now likely to scan the full table.".to_string()),
+            Some("Reintroduce narrowing filters before scanning the base table.".to_string()),
+        );
+    }
+
+    (None, None)
 }
 
 fn render_pr_review(report: &PrReviewReport) -> String {
@@ -1583,6 +1677,64 @@ fn render_pr_review_markdown(report: &PrReviewReport) -> String {
         }
 
         out.push('\n');
+    }
+
+    out
+}
+
+fn render_pr_review_cost_diff(report: &PrReviewReport) -> String {
+    let mut out = String::new();
+    out.push_str("SQL Cost Regression\n\n");
+    out.push_str(&format!(
+        "{} changed SQL files\n",
+        report.summary.changed_sql_files
+    ));
+
+    let mut any = false;
+    for file in &report.files {
+        if file.cost_regression.is_none() && file.scan_increase_factor.is_none() {
+            continue;
+        }
+
+        any = true;
+        out.push('\n');
+        out.push_str("File: ");
+        out.push_str(&file.path);
+        out.push_str("\n\n");
+        out.push_str("Estimated scan change:\n");
+        out.push_str("Before: ");
+        out.push_str(&file.estimated_scan_from);
+        out.push('\n');
+        out.push_str("After: ");
+        out.push_str(&file.estimated_scan_to);
+        out.push('\n');
+        if let Some(factor) = &file.scan_increase_factor {
+            out.push_str("Increase: ");
+            out.push_str(factor);
+            out.push('\n');
+        }
+        if let Some(level) = &file.cost_regression {
+            out.push('\n');
+            out.push_str("Cost regression: ");
+            out.push_str(level);
+            out.push('\n');
+        }
+        if let Some(reason) = &file.cost_regression_reason {
+            out.push('\n');
+            out.push_str("Reason:\n");
+            out.push_str(reason);
+            out.push('\n');
+        }
+        if let Some(recommendation) = &file.cost_recommendation {
+            out.push('\n');
+            out.push_str("Recommendation:\n");
+            out.push_str(recommendation);
+            out.push('\n');
+        }
+    }
+
+    if !any {
+        out.push_str("\nNo scan cost regressions detected.\n");
     }
 
     out
@@ -1875,6 +2027,7 @@ async fn main() -> Result<(), anyhow::Error> {
                 glob,
                 ci,
                 markdown,
+                cost_diff,
             } => {
                 let mut options = analysis_options(&config);
                 if let Some(dialect) = args.dialect {
@@ -1961,6 +2114,13 @@ async fn main() -> Result<(), anyhow::Error> {
                             summary.scan_cost_increase_files += 1;
                         }
                     }
+                    let (cost_regression_reason, cost_recommendation) =
+                        derive_cost_regression_reason(
+                            prev_sql.as_deref(),
+                            &curr_sql,
+                            &prev_findings,
+                            &curr_findings,
+                        );
 
                     reports.push(PrFileDelta {
                         path: file.display().to_string(),
@@ -1970,9 +2130,21 @@ async fn main() -> Result<(), anyhow::Error> {
                         new_issues: new_rules,
                         resolved_issues: resolved_rules,
                         persistent_risk_factors: persistent_rules,
-                        estimated_scan_from: bytes_to_tb_label(from_scan),
-                        estimated_scan_to: bytes_to_tb_label(to_scan),
+                        estimated_scan_from: if *cost_diff {
+                            bytes_to_human_label(from_scan)
+                        } else {
+                            bytes_to_tb_label(from_scan)
+                        },
+                        estimated_scan_to: if *cost_diff {
+                            bytes_to_human_label(to_scan)
+                        } else {
+                            bytes_to_tb_label(to_scan)
+                        },
                         scan_delta: scan_delta_label(from_scan, to_scan),
+                        cost_regression: cost_regression_level(from_scan, to_scan),
+                        cost_regression_reason,
+                        cost_recommendation,
+                        scan_increase_factor: scan_increase_factor_label(from_scan, to_scan),
                     });
                 }
 
@@ -2014,6 +2186,8 @@ async fn main() -> Result<(), anyhow::Error> {
                     print!("{}", render_pr_review_ci(&report));
                 } else if *markdown {
                     print!("{}", render_pr_review_markdown(&report));
+                } else if *cost_diff {
+                    print!("{}", render_pr_review_cost_diff(&report));
                 } else {
                     print!("{}", render_pr_review(&report));
                 }
@@ -2117,10 +2291,10 @@ mod tests {
         apply_inline_suppressions_to_analysis, apply_rule_controls, collect_sql_files,
         extract_suppressed_rules, guard_block_reasons, matches_pattern, merge_static_analysis,
         read_input, render_explanation, render_guard_report, render_lineage, render_pr_review,
-        render_pr_review_ci, render_pr_review_markdown, render_query_explanation,
-        render_risk_summary, render_tables, risk_score, should_fail, simulate_query, Args,
-        Commands, DialectArg, GuardReport, InputMode, PrFileDelta, PrReviewReport, PrReviewSummary,
-        ProviderArg, SeverityArg,
+        render_pr_review_ci, render_pr_review_cost_diff, render_pr_review_markdown,
+        render_query_explanation, render_risk_summary, render_tables, risk_score, should_fail,
+        simulate_query, Args, Commands, DialectArg, GuardReport, InputMode, PrFileDelta,
+        PrReviewReport, PrReviewSummary, ProviderArg, SeverityArg,
     };
     use clap::Parser;
     use sql_inspect::analyzer::{analyze_sql, AnalysisOptions};
@@ -2237,6 +2411,20 @@ mod tests {
         assert!(matches!(
             args.command,
             Some(Commands::PrReview { markdown: true, .. })
+        ));
+    }
+
+    #[test]
+    fn args_parse_pr_review_cost_diff() {
+        let args =
+            Args::try_parse_from(["sql-inspect", "pr-review", "--base", "main", "--cost-diff"])
+                .expect("pr-review cost-diff args should parse");
+        assert!(matches!(
+            args.command,
+            Some(Commands::PrReview {
+                cost_diff: true,
+                ..
+            })
         ));
     }
 
@@ -2761,6 +2949,10 @@ mod tests {
                 estimated_scan_from: "unknown".to_string(),
                 estimated_scan_to: "unknown".to_string(),
                 scan_delta: "unknown".to_string(),
+                cost_regression: None,
+                cost_regression_reason: None,
+                cost_recommendation: None,
+                scan_increase_factor: None,
             }],
         };
 
@@ -2818,6 +3010,14 @@ mod tests {
                 estimated_scan_from: "unknown".to_string(),
                 estimated_scan_to: "1.20 TB".to_string(),
                 scan_delta: "+1.20 TB".to_string(),
+                cost_regression: Some("MEDIUM".to_string()),
+                cost_regression_reason: Some(
+                    "Filter removed: order_date >= CURRENT_DATE - INTERVAL '30 days'".to_string(),
+                ),
+                cost_recommendation: Some(
+                    "Restore a selective WHERE or partition predicate.".to_string(),
+                ),
+                scan_increase_factor: Some("4.0x".to_string()),
             }],
         };
 
@@ -2825,6 +3025,49 @@ mod tests {
         assert!(rendered.contains("# SQL Inspect PR Review"));
         assert!(rendered.contains("## `models/example.sql`"));
         assert!(rendered.contains("**PR status:** **PASS**"));
+    }
+
+    #[test]
+    fn render_pr_review_cost_diff_highlights_scan_regression() {
+        let report = PrReviewReport {
+            base: "main".to_string(),
+            head: "HEAD".to_string(),
+            summary: PrReviewSummary {
+                status: "FAIL".to_string(),
+                changed_sql_files: 1,
+                new_high_risk_queries: 1,
+                partition_filter_regressions: 1,
+                order_by_without_limit_regressions: 0,
+                possible_join_amplification_regressions: 0,
+                scan_cost_increase_files: 1,
+            },
+            files: vec![PrFileDelta {
+                path: "models/revenue.sql".to_string(),
+                previous_risk: "LOW".to_string(),
+                current_risk: "HIGH".to_string(),
+                risk_trend: "regressed".to_string(),
+                new_issues: vec!["ATHENA_MISSING_PARTITION_FILTER".to_string()],
+                resolved_issues: vec![],
+                persistent_risk_factors: vec![],
+                estimated_scan_from: "22 GB".to_string(),
+                estimated_scan_to: "1.40 TB".to_string(),
+                scan_delta: "+1.38 TB".to_string(),
+                cost_regression: Some("HIGH".to_string()),
+                cost_regression_reason: Some(
+                    "Partition filter removed or missing on orders".to_string(),
+                ),
+                cost_recommendation: Some(
+                    "Restore a partition predicate on the scanned table.".to_string(),
+                ),
+                scan_increase_factor: Some("63.6x".to_string()),
+            }],
+        };
+
+        let rendered = render_pr_review_cost_diff(&report);
+        assert!(rendered.contains("SQL Cost Regression"));
+        assert!(rendered.contains("Cost regression: HIGH"));
+        assert!(rendered.contains("Increase: 63.6x"));
+        assert!(rendered.contains("Recommendation:"));
     }
 
     #[test]
