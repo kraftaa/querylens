@@ -1040,10 +1040,33 @@ fn estimate_scan_from_stats_file(args: &Args, sql: Option<&str>) -> anyhow::Resu
     }
 
     if matched {
-        Ok(Some(total))
+        let factor = stats_filter_factor(sql);
+        Ok(Some((total as f64 * factor) as u64))
     } else {
         Ok(None)
     }
+}
+
+fn stats_filter_factor(sql: &str) -> f64 {
+    let filters = extract_lineage_report(sql).filters;
+    if filters.is_empty() {
+        return 1.0;
+    }
+
+    let mut factor = 0.1_f64;
+    for filter in filters {
+        let lower = filter.to_ascii_lowercase();
+        if lower.contains("date")
+            || lower.contains("_at")
+            || lower.contains("timestamp")
+            || lower.contains("ds")
+            || lower.contains("partition")
+        {
+            factor = factor.min(0.02);
+        }
+    }
+
+    factor
 }
 
 fn lookup_table_bytes(value: &serde_json::Value, table: &str) -> Option<u64> {
@@ -2864,6 +2887,50 @@ mod tests {
         )
         .expect("label");
         assert_eq!(label, "1.20 TB");
+
+        std::fs::remove_file(path).expect("cleanup file");
+        std::fs::remove_dir_all(dir).expect("cleanup dir");
+    }
+
+    #[test]
+    fn estimated_scan_label_reduces_stats_estimate_for_date_filter() {
+        let dir = temp_test_dir("stats-file-filter");
+        let path = dir.join("stats.json");
+        std::fs::write(
+            &path,
+            r#"{
+  "tables": {
+    "orders": { "bytes": 1500000000000 }
+  }
+}"#,
+        )
+        .expect("write stats");
+
+        let args = Args {
+            command: None,
+            provider: ProviderArg::Openai,
+            sql: None,
+            file: None,
+            dir: None,
+            glob: "*.sql".to_string(),
+            dialect: None,
+            config: None,
+            static_only: false,
+            fail_on: None,
+            json: false,
+            scan_bytes: None,
+            scan_tb: None,
+            athena_query_execution_id: None,
+            athena_region: None,
+            stats_file: Some(path.clone()),
+        };
+
+        let label = super::estimated_scan_label(
+            &args,
+            Some("SELECT * FROM orders WHERE order_date >= DATE '2026-01-01'"),
+        )
+        .expect("label");
+        assert_eq!(label, "0.03 TB");
 
         std::fs::remove_file(path).expect("cleanup file");
         std::fs::remove_dir_all(dir).expect("cleanup dir");
