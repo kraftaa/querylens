@@ -62,6 +62,10 @@ enum Commands {
     Explain {
         file: PathBuf,
     },
+    PgExplain {
+        #[arg(long)]
+        file: PathBuf,
+    },
     Analyze {
         dir: PathBuf,
         #[arg(long, default_value = "*.sql")]
@@ -240,6 +244,26 @@ struct GuardReport {
     risk: String,
     blocking_violations: Vec<String>,
     why_blocked: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+struct PgBuffers {
+    shared_hit: u64,
+    shared_read: u64,
+    shared_dirtied: u64,
+    shared_written: u64,
+    temp_read: u64,
+    temp_written: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PgExplainSummary {
+    planning_time_ms: Option<f64>,
+    execution_time_ms: Option<f64>,
+    total_rows: Option<f64>,
+    seq_scans: Vec<String>,
+    buffers: Option<PgBuffers>,
+    warnings: Vec<String>,
 }
 
 fn env(name: &'static str) -> Result<String, AppError> {
@@ -1798,6 +1822,196 @@ fn render_guard_report(report: &GuardReport) -> String {
     out
 }
 
+fn render_pg_explain(summary: &PgExplainSummary) -> String {
+    let mut out = String::new();
+    out.push_str("PG Explain Analysis\n");
+    out.push_str("\nExecution time: ");
+    out.push_str(
+        &summary
+            .execution_time_ms
+            .map(|t| format!("{t:.2} ms"))
+            .unwrap_or_else(|| "unknown".to_string()),
+    );
+    out.push_str("\nPlanning time: ");
+    out.push_str(
+        &summary
+            .planning_time_ms
+            .map(|t| format!("{t:.2} ms"))
+            .unwrap_or_else(|| "unknown".to_string()),
+    );
+    out.push('\n');
+
+    out.push_str("Rows: ");
+    out.push_str(
+        &summary
+            .total_rows
+            .map(|r| format!("{r:.0}"))
+            .unwrap_or_else(|| "unknown".to_string()),
+    );
+    out.push('\n');
+
+    out.push_str("Seq scans: ");
+    if summary.seq_scans.is_empty() {
+        out.push_str("none");
+    } else {
+        out.push_str(&summary.seq_scans.join(", "));
+    }
+    out.push('\n');
+
+    if let Some(buf) = &summary.buffers {
+        out.push_str("Buffers:\n");
+        out.push_str(&format!(
+            "  shared hit/read/dirtied/written: {}/{}/{}/{}\n",
+            buf.shared_hit, buf.shared_read, buf.shared_dirtied, buf.shared_written
+        ));
+        out.push_str(&format!(
+            "  temp read/written: {}/{}\n",
+            buf.temp_read, buf.temp_written
+        ));
+    }
+
+    if !summary.warnings.is_empty() {
+        out.push_str("\nWarnings:\n");
+        for w in &summary.warnings {
+            out.push_str("- ");
+            out.push_str(w);
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+fn parse_pg_explain_summary(input: &str) -> anyhow::Result<PgExplainSummary> {
+    let value: serde_json::Value = serde_json::from_str(input)
+        .map_err(|e| anyhow::anyhow!("failed to parse EXPLAIN JSON: {e}"))?;
+
+    let root = if let Some(arr) = value.as_array() {
+        arr.get(0)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("EXPLAIN JSON array is empty"))?
+    } else {
+        value
+    };
+
+    let plan = root
+        .get("Plan")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("EXPLAIN JSON missing Plan key"))?;
+
+    let planning_time_ms = root.get("Planning Time").and_then(|v| v.as_f64());
+    let execution_time_ms = root.get("Execution Time").and_then(|v| v.as_f64());
+
+    let mut seq_scans = Vec::new();
+    let mut warnings = Vec::new();
+    let mut buffers = PgBuffers::default();
+    let mut total_rows_acc = 0.0_f64;
+
+    walk_pg_plan(
+        &plan,
+        &mut seq_scans,
+        &mut total_rows_acc,
+        &mut buffers,
+        &mut warnings,
+    );
+
+    let buffers_present = buffers.shared_hit
+        + buffers.shared_read
+        + buffers.shared_dirtied
+        + buffers.shared_written
+        + buffers.temp_read
+        + buffers.temp_written
+        > 0;
+
+    Ok(PgExplainSummary {
+        planning_time_ms,
+        execution_time_ms,
+        total_rows: if total_rows_acc > 0.0 {
+            Some(total_rows_acc)
+        } else {
+            None
+        },
+        seq_scans,
+        buffers: if buffers_present { Some(buffers) } else { None },
+        warnings,
+    })
+}
+
+fn walk_pg_plan(
+    plan: &serde_json::Value,
+    seq_scans: &mut Vec<String>,
+    total_rows: &mut f64,
+    buffers: &mut PgBuffers,
+    warnings: &mut Vec<String>,
+) {
+    let node_type = plan
+        .get("Node Type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Unknown");
+    let relation = plan
+        .get("Relation Name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let alias = plan.get("Alias").and_then(|v| v.as_str()).unwrap_or("");
+
+    let loops = plan
+        .get("Actual Loops")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+    if let Some(rows) = plan.get("Actual Rows").and_then(|v| v.as_f64()) {
+        *total_rows += rows * loops;
+    }
+
+    accumulate_buffers(plan, buffers);
+
+    if node_type == "Seq Scan" {
+        let label = if !relation.is_empty() {
+            relation.to_string()
+        } else if !alias.is_empty() {
+            alias.to_string()
+        } else {
+            "Seq Scan".to_string()
+        };
+        seq_scans.push(label.clone());
+        if plan.get("Filter").is_none() {
+            warnings.push(format!("Seq Scan on {label} without filter"));
+        }
+    }
+
+    if let Some(children) = plan.get("Plans").and_then(|v| v.as_array()) {
+        for child in children {
+            walk_pg_plan(child, seq_scans, total_rows, buffers, warnings);
+        }
+    }
+}
+
+fn accumulate_buffers(plan: &serde_json::Value, buffers: &mut PgBuffers) {
+    buffers.shared_hit += plan
+        .get("Shared Hit Blocks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    buffers.shared_read += plan
+        .get("Shared Read Blocks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    buffers.shared_dirtied += plan
+        .get("Shared Dirtied Blocks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    buffers.shared_written += plan
+        .get("Shared Written Blocks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    buffers.temp_read += plan
+        .get("Temp Read Blocks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    buffers.temp_written += plan
+        .get("Temp Written Blocks")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+}
+
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     let args = Args::parse();
@@ -1921,6 +2135,17 @@ async fn main() -> Result<(), anyhow::Error> {
             Commands::Explain { file } => {
                 let sql = read_sql_file(file)?;
                 print!("{}", render_query_explanation(&sql));
+                return Ok(());
+            }
+            Commands::PgExplain { file } => {
+                let raw = std::fs::read_to_string(file)
+                    .map_err(|e| anyhow::anyhow!("failed to read {}: {e}", file.display()))?;
+                let summary = parse_pg_explain_summary(&raw)?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&summary)?);
+                } else {
+                    print!("{}", render_pg_explain(&summary));
+                }
                 return Ok(());
             }
             Commands::Analyze {
@@ -2313,10 +2538,11 @@ mod tests {
     use super::{
         apply_inline_suppressions_to_analysis, apply_rule_controls, collect_sql_files,
         extract_suppressed_rules, guard_block_reasons, matches_pattern, merge_static_analysis,
-        read_input, render_explanation, render_guard_report, render_lineage, render_pr_review,
-        render_pr_review_ci, render_pr_review_cost_diff, render_pr_review_markdown,
-        render_query_explanation, render_risk_summary, render_tables, risk_score, should_fail,
-        simulate_query, Args, Commands, DialectArg, GuardReport, InputMode, PrFileDelta,
+        parse_pg_explain_summary, read_input, render_explanation, render_guard_report,
+        render_lineage, render_pg_explain, render_pr_review, render_pr_review_ci,
+        render_pr_review_cost_diff, render_pr_review_markdown, render_query_explanation,
+        render_risk_summary, render_tables, risk_score, should_fail, simulate_query, Args,
+        Commands, DialectArg, GuardReport, InputMode, PrFileDelta,
         PrReviewReport, PrReviewSummary, ProviderArg, SeverityArg,
     };
     use clap::Parser;
@@ -2468,6 +2694,13 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn args_parse_pg_explain() {
+        let args = Args::try_parse_from(["sql-inspect", "pg-explain", "--file", "explain.json"])
+            .expect("pg-explain args should parse");
+        assert!(matches!(args.command, Some(Commands::PgExplain { .. })));
     }
 
     #[test]
@@ -3163,6 +3396,33 @@ mod tests {
         assert!(rendered.contains("SQL Inspect Risk"));
         assert!(rendered.contains("Risk: HIGH"));
         assert!(rendered.contains("Top reasons:"));
+    }
+
+    #[test]
+    fn parse_pg_explain_basic() {
+        let json = r#"
+[
+  {
+    "Plan": {
+      "Node Type": "Seq Scan",
+      "Relation Name": "orders",
+      "Actual Rows": 1000,
+      "Actual Loops": 1
+    },
+    "Planning Time": 1.23,
+    "Execution Time": 12.34
+  }
+]
+"#;
+        let summary = parse_pg_explain_summary(json).expect("parse explain");
+        assert_eq!(summary.execution_time_ms, Some(12.34));
+        assert_eq!(summary.planning_time_ms, Some(1.23));
+        assert!(summary.seq_scans.contains(&"orders".to_string()));
+        assert_eq!(summary.total_rows, Some(1000.0));
+
+        let rendered = render_pg_explain(&summary);
+        assert!(rendered.contains("Execution time"));
+        assert!(rendered.contains("Seq scans"));
     }
 
     #[test]
