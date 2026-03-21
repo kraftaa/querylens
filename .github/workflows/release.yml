@@ -144,7 +144,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download artifacts
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Download other artifacts
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
@@ -155,10 +162,10 @@ jobs:
           files: |
             release-artifacts/**/*.tar.gz
             release-artifacts/**/SHA256SUMS
-            release-artifacts/**/*.whl
+            dist/*.whl
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          packages_dir: release-artifacts
+          packages_dir: dist
           skip_existing: true
