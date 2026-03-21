@@ -1922,7 +1922,7 @@ fn parse_pg_explain_summary(input: &str) -> anyhow::Result<PgExplainSummary> {
         .map_err(|e| anyhow::anyhow!("failed to parse EXPLAIN JSON: {e}"))?;
 
     let root = if let Some(arr) = value.as_array() {
-        arr.get(0)
+        arr.first()
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("EXPLAIN JSON array is empty"))?
     } else {
