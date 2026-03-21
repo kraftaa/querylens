@@ -11,3 +11,7 @@ all-files.md
 examples/silver*
 examples/gold*
 examples/bronze*
+other
+*silver*
+*gold*
+*bronze*

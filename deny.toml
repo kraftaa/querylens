@@ -4,19 +4,10 @@ features = ["default"]
 
 [advisories]
 yanked = "warn"
+ignore = ["RUSTSEC-2026-0049"] # rustls-webpki CRL DP parsing; pending upstream fix
 
 [licenses]
-allow = [
-  "Apache-2.0",
-  "MIT",
-  "BSD-2-Clause",
-  "BSD-3-Clause",
-  "CDLA-Permissive-2.0",
-  "ISC",
-  "Unicode-3.0",
-  "OpenSSL",
-  "Zlib",
-]
+allow = ["Apache-2.0", "MIT", "BSD-3-Clause", "CDLA-Permissive-2.0", "ISC", "Unicode-3.0"]
 
 [bans]
 multiple-versions = "warn"
