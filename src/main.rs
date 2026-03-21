@@ -4,11 +4,11 @@ use sql_inspect::config::{load_config, SqlInspectConfig};
 use sql_inspect::error::AppError;
 use sql_inspect::insights::{explain_query, extract_lineage_report, extract_tables};
 use sql_inspect::prompt::{build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation};
+#[cfg(feature = "bedrock")]
+use sql_inspect::providers::bedrock::BedrockProvider;
 use sql_inspect::providers::local::LocalProvider;
 use sql_inspect::providers::openai::OpenAIProvider;
 use sql_inspect::providers::LlmProvider;
-#[cfg(feature = "bedrock")]
-use sql_inspect::providers::bedrock::BedrockProvider;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
