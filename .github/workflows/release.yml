@@ -75,10 +75,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            archive_name: sql-inspect-linux-x86_64.tar.gz
+            archive_name: querylens-linux-x86_64.tar.gz
           - os: macos-latest
             target: aarch64-apple-darwin
-            archive_name: sql-inspect-macos-aarch64.tar.gz
+            archive_name: querylens-macos-aarch64.tar.gz
 
     runs-on: ${{ matrix.os }}
 
@@ -102,8 +102,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/sql-inspect dist/
-          tar -C dist -czf "${{ matrix.archive_name }}" sql-inspect
+          cp target/${{ matrix.target }}/release/querylens dist/
+          tar -C dist -czf "${{ matrix.archive_name }}" querylens
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

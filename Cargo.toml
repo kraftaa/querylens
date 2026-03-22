@@ -1,5 +1,5 @@
 [package]
-name = "sql-inspect"
+name = "querylens"
 version = "0.1.11"
 edition = "2021"
 license = "MIT"

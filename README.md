@@ -1,8 +1,8 @@
-# sql-inspect
+# querylens
 
 Catch risky analytics SQL before it runs and explain what complex queries actually do.
 
-`sql-inspect` scans SQL repositories, ranks the worst files first, reviews pull requests for regressions, and highlights reliability and cost risks such as full table scans, wide joins, missing filters, and expensive query patterns before they merge and hit production.
+`querylens` scans SQL repositories, ranks the worst files first, reviews pull requests for regressions, and highlights reliability and cost risks such as full table scans, wide joins, missing filters, and expensive query patterns before they merge and hit production.
 
 ## Quick Demo
 
@@ -40,15 +40,15 @@ o.customer_id
 Prebuilt binary:
 
 ```bash
-curl -L -o sql-inspect.tar.gz https://github.com/kraftaa/sql-inspect/releases/download/v0.1.2/sql-inspect-macos-aarch64.tar.gz
-tar -xzf sql-inspect.tar.gz
-./sql-inspect --help
+curl -L -o querylens.tar.gz https://github.com/kraftaa/querylens/releases/download/v0.1.11/querylens-macos-aarch64.tar.gz
+tar -xzf querylens.tar.gz
+./querylens --help
 ```
 
 Homebrew:
 
 ```bash
-brew install kraftaa/tap/sql-inspect
+brew install kraftaa/tap/querylens
 ```
 
 Build from source:
@@ -82,7 +82,7 @@ When a metric looks wrong, teams need to:
 - catch risky query patterns before they hit production
 - understand query intent quickly
 
-`sql-inspect` helps with deterministic checks and optional LLM explanations.
+`querylens` helps with deterministic checks and optional LLM explanations.
 
 ## Detect Risky SQL Patterns
 
@@ -119,13 +119,13 @@ Expected suggestion includes:
 
 dbt builds and runs transformation pipelines.
 
-`sql-inspect` analyzes SQL itself:
+`querylens` analyzes SQL itself:
 
 - detect risky query patterns
 - trace lineage in query text
 - explain query logic
 
-They complement each other: dbt for orchestration/modeling, `sql-inspect` for query inspection.
+They complement each other: dbt for orchestration/modeling, `querylens` for query inspection.
 
 ## Distribution
 
@@ -133,8 +133,8 @@ They complement each other: dbt for orchestration/modeling, `sql-inspect` for qu
 
 Tagging `v*` triggers `.github/workflows/release.yml` and publishes:
 
-- `sql-inspect-macos-aarch64.tar.gz`
-- `sql-inspect-linux-x86_64.tar.gz`
+- `querylens-macos-aarch64.tar.gz`
+- `querylens-linux-x86_64.tar.gz`
 - `SHA256SUMS`
 
 Create a release tag:
@@ -148,17 +148,17 @@ git push origin v0.1.2
 
 Use the formula template at:
 
-- `packaging/homebrew/sql-inspect.rb`
+- `packaging/homebrew/querylens.rb`
 
 For each release:
 
 1. Set `version` (without `v`).
 2. Fill `__SHA256_MACOS_AARCH64__` and `__SHA256_LINUX_X86_64__` from `SHA256SUMS`.
-3. Commit the formula in your tap repo (for example `kraftaa/homebrew-tap`) as `Formula/sql-inspect.rb`.
+3. Commit the formula in your tap repo (for example `kraftaa/homebrew-tap`) as `Formula/querylens.rb`.
 4. Users install with:
 
 ```bash
-brew install kraftaa/tap/sql-inspect
+brew install kraftaa/tap/querylens
 ```
 
 ## Usage
@@ -445,7 +445,7 @@ Optional:
 - `--static-only`
 - `--fail-on low|medium|high`
 - `--glob "*.sql"`
-- `--config sql-inspect.toml`
+- `--config querylens.toml`
 - `--json`
 
 OpenAI example:
@@ -474,7 +474,7 @@ cargo run -- --provider local --file examples/query.sql --json
 
 ## Config
 
-Create `sql-inspect.toml`:
+Create `querylens.toml`:
 
 ```toml
 dialect = "athena"
@@ -527,7 +527,7 @@ cargo run -- analyze models --glob "*.sql" --changed-only
 Add suppression comments directly in SQL when needed:
 
 ```sql
--- sql-inspect: disable=SELECT_STAR,MISSING_WHERE
+-- querylens: disable=SELECT_STAR,MISSING_WHERE
 SELECT * FROM some_small_reference_table
 ```
 
@@ -546,7 +546,7 @@ Ready-to-run examples:
 ## Project Layout
 
 ```text
-sql-inspect/
+querylens/
   Cargo.toml
   src/
     main.rs

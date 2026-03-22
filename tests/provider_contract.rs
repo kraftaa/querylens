@@ -1,6 +1,6 @@
-use sql_inspect::error::AppError;
-use sql_inspect::prompt::{build_prompt, parse_sql_explanation};
-use sql_inspect::providers::LlmProvider;
+use querylens::error::AppError;
+use querylens::prompt::{build_prompt, parse_sql_explanation};
+use querylens::providers::LlmProvider;
 
 struct FakeProvider {
     response: String,

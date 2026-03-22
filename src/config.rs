@@ -22,7 +22,7 @@ pub fn load_config(path: Option<&Path>) -> anyhow::Result<SqlInspectConfig> {
     let config_path = match path {
         Some(path) => Some(path.to_path_buf()),
         None => {
-            let default = PathBuf::from("sql-inspect.toml");
+            let default = PathBuf::from("querylens.toml");
             if default.exists() {
                 Some(default)
             } else {
@@ -61,7 +61,7 @@ mod tests {
     #[test]
     fn explicit_config_parses() {
         let tmp = tempfile_dir();
-        let path = tmp.join("sql-inspect.toml");
+        let path = tmp.join("querylens.toml");
         std::fs::write(
             &path,
             "dialect = \"athena\"\nfail_on = \"medium\"\nglob = \"*.sql\"\nsuggest_limit_for_exploratory = false\n[rules.SELECT_STAR]\nenabled = false\nseverity = \"medium\"\n",
@@ -90,7 +90,7 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("unix time")
             .as_nanos();
-        let dir = base.join(format!("sql-inspect-test-{}-{nanos}", std::process::id()));
+        let dir = base.join(format!("querylens-test-{}-{nanos}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir

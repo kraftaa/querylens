@@ -1,14 +1,14 @@
 use clap::{Parser, ValueEnum};
-use sql_inspect::analyzer::{analyze_sql, AnalysisOptions, Dialect, StaticAnalysis};
-use sql_inspect::config::{load_config, SqlInspectConfig};
-use sql_inspect::error::AppError;
-use sql_inspect::insights::{explain_query, extract_lineage_report, extract_tables};
-use sql_inspect::prompt::{build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation};
+use querylens::analyzer::{analyze_sql, AnalysisOptions, Dialect, StaticAnalysis};
+use querylens::config::{load_config, SqlInspectConfig};
+use querylens::error::AppError;
+use querylens::insights::{explain_query, extract_lineage_report, extract_tables};
+use querylens::prompt::{build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation};
 #[cfg(feature = "bedrock")]
-use sql_inspect::providers::bedrock::BedrockProvider;
-use sql_inspect::providers::local::LocalProvider;
-use sql_inspect::providers::openai::OpenAIProvider;
-use sql_inspect::providers::LlmProvider;
+use querylens::providers::bedrock::BedrockProvider;
+use querylens::providers::local::LocalProvider;
+use querylens::providers::openai::OpenAIProvider;
+use querylens::providers::LlmProvider;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -106,7 +106,7 @@ enum Commands {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "sql-inspect")]
+#[command(name = "querylens")]
 struct Args {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -396,10 +396,10 @@ fn extract_suppressed_rules(sql: &str) -> HashSet<String> {
     let mut suppressed = HashSet::new();
     for line in sql.lines() {
         let lower = line.to_ascii_lowercase();
-        let Some(idx) = lower.find("sql-inspect: disable=") else {
+        let Some(idx) = lower.find("querylens: disable=") else {
             continue;
         };
-        let raw = &line[idx + "sql-inspect: disable=".len()..];
+        let raw = &line[idx + "querylens: disable=".len()..];
         let raw = raw
             .split("*/")
             .next()
@@ -1180,7 +1180,7 @@ fn simulate_query(sql: &str, limit: usize) -> String {
         return format!("{trimmed}\nLIMIT {limit};");
     }
 
-    format!("SELECT *\nFROM (\n{trimmed}\n) AS sql_inspect_preview\nLIMIT {limit};")
+    format!("SELECT *\nFROM (\n{trimmed}\n) AS querylens_preview\nLIMIT {limit};")
 }
 
 fn strip_sql_comments(sql: &str) -> String {
@@ -2654,16 +2654,16 @@ mod tests {
         ProviderArg, SeverityArg,
     };
     use clap::Parser;
-    use sql_inspect::analyzer::{analyze_sql, AnalysisOptions};
-    use sql_inspect::config::{RuleControl, SqlInspectConfig};
-    use sql_inspect::prompt::{Finding, Severity, SqlExplanation};
+    use querylens::analyzer::{analyze_sql, AnalysisOptions};
+    use querylens::config::{RuleControl, SqlInspectConfig};
+    use querylens::prompt::{Finding, Severity, SqlExplanation};
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
     #[test]
     fn args_parse_inline_sql() {
         let args =
-            Args::try_parse_from(["sql-inspect", "--sql", "select 1"]).expect("args should parse");
+            Args::try_parse_from(["querylens", "--sql", "select 1"]).expect("args should parse");
 
         assert!(matches!(args.provider, ProviderArg::Openai));
         assert_eq!(args.sql.as_deref(), Some("select 1"));
@@ -2674,27 +2674,23 @@ mod tests {
 
     #[test]
     fn args_parse_tables_subcommand() {
-        let args = Args::try_parse_from(["sql-inspect", "tables", "examples/query.sql"])
+        let args = Args::try_parse_from(["querylens", "tables", "examples/query.sql"])
             .expect("subcommand args should parse");
         assert!(matches!(args.command, Some(Commands::Tables { .. })));
     }
 
     #[test]
     fn args_parse_risk_subcommand() {
-        let args = Args::try_parse_from(["sql-inspect", "risk", "examples/query.sql"])
+        let args = Args::try_parse_from(["querylens", "risk", "examples/query.sql"])
             .expect("subcommand args should parse");
         assert!(matches!(args.command, Some(Commands::Risk { .. })));
     }
 
     #[test]
     fn args_parse_risk_summary_only() {
-        let args = Args::try_parse_from([
-            "sql-inspect",
-            "risk",
-            "examples/query.sql",
-            "--summary-only",
-        ])
-        .expect("risk summary-only args should parse");
+        let args =
+            Args::try_parse_from(["querylens", "risk", "examples/query.sql", "--summary-only"])
+                .expect("risk summary-only args should parse");
         assert!(matches!(
             args.command,
             Some(Commands::Risk {
@@ -2707,7 +2703,7 @@ mod tests {
     #[test]
     fn args_parse_guard_subcommand() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "guard",
             "examples/query.sql",
             "--max-risk",
@@ -2722,7 +2718,7 @@ mod tests {
     #[test]
     fn args_parse_simulate_subcommand() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "simulate",
             "examples/query.sql",
             "--limit",
@@ -2735,7 +2731,7 @@ mod tests {
     #[test]
     fn args_parse_pr_review_subcommand() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "pr-review",
             "--base",
             "main",
@@ -2752,7 +2748,7 @@ mod tests {
 
     #[test]
     fn args_parse_pr_review_ci() {
-        let args = Args::try_parse_from(["sql-inspect", "pr-review", "--base", "main", "--ci"])
+        let args = Args::try_parse_from(["querylens", "pr-review", "--base", "main", "--ci"])
             .expect("pr-review ci args should parse");
         assert!(matches!(
             args.command,
@@ -2762,9 +2758,8 @@ mod tests {
 
     #[test]
     fn args_parse_pr_review_markdown() {
-        let args =
-            Args::try_parse_from(["sql-inspect", "pr-review", "--base", "main", "--markdown"])
-                .expect("pr-review markdown args should parse");
+        let args = Args::try_parse_from(["querylens", "pr-review", "--base", "main", "--markdown"])
+            .expect("pr-review markdown args should parse");
         assert!(matches!(
             args.command,
             Some(Commands::PrReview { markdown: true, .. })
@@ -2774,7 +2769,7 @@ mod tests {
     #[test]
     fn args_parse_pr_review_cost_diff() {
         let args =
-            Args::try_parse_from(["sql-inspect", "pr-review", "--base", "main", "--cost-diff"])
+            Args::try_parse_from(["querylens", "pr-review", "--base", "main", "--cost-diff"])
                 .expect("pr-review cost-diff args should parse");
         assert!(matches!(
             args.command,
@@ -2788,7 +2783,7 @@ mod tests {
     #[test]
     fn args_parse_lineage_column() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "lineage",
             "examples/revenue.sql",
             "--column",
@@ -2806,14 +2801,14 @@ mod tests {
 
     #[test]
     fn args_parse_pg_explain() {
-        let args = Args::try_parse_from(["sql-inspect", "pg-explain", "--file", "explain.json"])
+        let args = Args::try_parse_from(["querylens", "pg-explain", "--file", "explain.json"])
             .expect("pg-explain args should parse");
         assert!(matches!(args.command, Some(Commands::PgExplain { .. })));
     }
 
     #[test]
     fn args_parse_pg_explain_run_with_sql() {
-        let args = Args::try_parse_from(["sql-inspect", "pg-explain-run", "--sql", "select 1"])
+        let args = Args::try_parse_from(["querylens", "pg-explain-run", "--sql", "select 1"])
             .expect("pg-explain-run args should parse");
         assert!(matches!(args.command, Some(Commands::PgExplainRun { .. })));
     }
@@ -2821,7 +2816,7 @@ mod tests {
     #[test]
     fn args_parse_analyze_with_verbose() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "analyze",
             "examples",
             "--glob",
@@ -2838,7 +2833,7 @@ mod tests {
     #[test]
     fn args_parse_risk_with_scan_tb() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "risk",
             "examples/query.sql",
             "--scan-tb",
@@ -2852,7 +2847,7 @@ mod tests {
     #[test]
     fn args_parse_dir_and_fail_threshold() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "--dir",
             "models",
             "--dialect",
@@ -2872,7 +2867,7 @@ mod tests {
     #[test]
     fn args_parse_analyze_changed_only() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "analyze",
             "examples",
             "--glob",
@@ -2892,7 +2887,7 @@ mod tests {
     #[test]
     fn args_parse_analyze_with_top() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "analyze",
             "examples",
             "--glob",
@@ -2910,7 +2905,7 @@ mod tests {
     #[test]
     fn args_parse_analyze_with_changed_base() {
         let args = Args::try_parse_from([
-            "sql-inspect",
+            "querylens",
             "analyze",
             "examples",
             "--glob",
@@ -3307,7 +3302,7 @@ mod tests {
 
     #[test]
     fn extracts_suppressed_rules_from_comment() {
-        let sql = "-- sql-inspect: disable=SELECT_STAR, MISSING_WHERE\nSELECT * FROM orders";
+        let sql = "-- querylens: disable=SELECT_STAR, MISSING_WHERE\nSELECT * FROM orders";
         let rules = extract_suppressed_rules(sql);
         assert!(rules.contains("SELECT_STAR"));
         assert!(rules.contains("MISSING_WHERE"));
@@ -3315,7 +3310,7 @@ mod tests {
 
     #[test]
     fn inline_suppression_removes_matching_findings() {
-        let sql = "-- sql-inspect: disable=SELECT_STAR\nSELECT * FROM orders";
+        let sql = "-- querylens: disable=SELECT_STAR\nSELECT * FROM orders";
         let mut analysis = analyze_sql(sql, AnalysisOptions::default());
         apply_inline_suppressions_to_analysis(&mut analysis, sql);
         assert!(!analysis.findings.iter().any(|f| f.rule_id == "SELECT_STAR"));
@@ -3639,7 +3634,7 @@ mod tests {
 
     fn temp_test_dir(name: &str) -> PathBuf {
         let dir =
-            std::env::temp_dir().join(format!("sql-inspect-main-{name}-{}", std::process::id()));
+            std::env::temp_dir().join(format!("querylens-main-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
         dir
