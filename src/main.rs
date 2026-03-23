@@ -1128,24 +1128,25 @@ fn parse_table_stats(root: &serde_json::Value, table: &str) -> Option<TableStats
         .and_then(|v| v.get(table))
         .or_else(|| root.get(table))?;
 
-    let mut stats = TableStats::default();
-    stats.total_bytes = parse_bytes_value(node.get("total_bytes").unwrap_or(node));
-    stats.row_count = node
-        .get("row_count")
-        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()));
-    stats.partition_columns = node
-        .get("partition_columns")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
-                .collect()
-        })
-        .unwrap_or_default();
-    stats.partitions_per_year = node
-        .get("partitions_per_year")
-        .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
-        .map(|n| n as u32);
+    let stats = TableStats {
+        total_bytes: parse_bytes_value(node.get("total_bytes").unwrap_or(node)),
+        row_count: node
+            .get("row_count")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())),
+        partition_columns: node
+            .get("partition_columns")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        partitions_per_year: node
+            .get("partitions_per_year")
+            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
+            .map(|n| n as u32),
+    };
 
     if stats.total_bytes.is_none()
         && stats.row_count.is_none()

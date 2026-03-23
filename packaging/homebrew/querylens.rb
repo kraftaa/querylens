@@ -1,7 +1,7 @@
 class Querylens < Formula
   desc "Static SQL inspection and optional LLM-backed explanations"
   homepage "https://github.com/kraftaa/querylens"
-  version "0.1.14"
+  version "0.1.15"
   license "MIT"
 
   on_macos do
