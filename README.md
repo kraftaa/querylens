@@ -37,19 +37,15 @@ o.customer_id
 
 ## Install
 
-Prebuilt binary:
+Preferred (PyPI):
 
 ```bash
-curl -L -o querylens.tar.gz https://github.com/kraftaa/querylens/releases/download/v0.1.11/querylens-macos-aarch64.tar.gz
-tar -xzf querylens.tar.gz
-./querylens --help
+pip install querylens
+querylens --help
 ```
 
-Homebrew:
-
-```bash
-brew install kraftaa/tap/querylens
-```
+GitHub binaries / Homebrew:
+- Will be available once GitHub releases for `querylens` are published; use the PyPI build for now.
 
 Build from source:
 
