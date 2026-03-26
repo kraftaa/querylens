@@ -24,9 +24,14 @@ pub struct QueryExplanation {
 }
 
 pub fn extract_tables(sql: &str) -> Vec<String> {
-    let normalized = sql.to_ascii_lowercase();
-    let tokens: Vec<&str> = normalized.split_whitespace().collect();
     let mut tables = Vec::new();
+
+    // Capture dbt-style references before stripping Jinja.
+    tables.extend(extract_dbt_refs(sql));
+
+    // Strip Jinja/templating blocks so token scan ignores them.
+    let normalized = strip_jinja(sql).to_ascii_lowercase();
+    let tokens: Vec<&str> = normalized.split_whitespace().collect();
 
     let mut i = 0;
     while i + 1 < tokens.len() {
@@ -46,6 +51,73 @@ pub fn extract_tables(sql: &str) -> Vec<String> {
     }
 
     tables
+}
+
+fn strip_jinja(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '{' && matches!(chars.peek(), Some('{') | Some('%')) {
+            // consume the opening
+            chars.next();
+            // skip until closing }} or %}.
+            while let Some(n) = chars.next() {
+                if (n == '}' && matches!(chars.peek(), Some('}')))
+                    || (n == '%' && matches!(chars.peek(), Some('}')))
+                {
+                    chars.next();
+                    break;
+                }
+            }
+            out.push(' ');
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn extract_dbt_refs(sql: &str) -> Vec<String> {
+    let lower = sql.to_ascii_lowercase();
+    let mut refs = Vec::new();
+    let mut idx = 0;
+    while let Some(pos) = lower[idx..].find("ref(") {
+        let start = idx + pos + 4;
+        if let Some(end) = lower[start..].find(')') {
+            let arg = lower[start..start + end].trim();
+            if let Some(name) = trim_quotes(arg) {
+                refs.push(name.to_string());
+            }
+            idx = start + end;
+        } else {
+            break;
+        }
+    }
+
+    idx = 0;
+    while let Some(pos) = lower[idx..].find("source(") {
+        let start = idx + pos + 7;
+        if let Some(end) = lower[start..].find(')') {
+            let args = lower[start..start + end].split(',').collect::<Vec<_>>();
+            if args.len() >= 2 {
+                if let Some(name) = trim_quotes(args[1].trim()) {
+                    refs.push(name.to_string());
+                }
+            }
+            idx = start + end;
+        } else {
+            break;
+        }
+    }
+
+    refs
+}
+
+fn trim_quotes(s: &str) -> Option<&str> {
+    if (s.starts_with('\"') && s.ends_with('\"')) || (s.starts_with('\'') && s.ends_with('\'')) {
+        return Some(&s[1..s.len().saturating_sub(1)]);
+    }
+    None
 }
 
 pub fn extract_lineage(sql: &str) -> Vec<LineageItem> {

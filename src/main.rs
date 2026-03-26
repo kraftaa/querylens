@@ -1,6 +1,7 @@
 use clap::{Parser, ValueEnum};
 use querylens::analyzer::{analyze_sql, AnalysisOptions, Dialect, StaticAnalysis};
 use querylens::config::{load_config, SqlInspectConfig};
+use querylens::cost::{collect_postgres_stats, estimate_cost, load_stats_map, CostEstimate};
 use querylens::error::AppError;
 use querylens::insights::{explain_query, extract_lineage_report, extract_tables};
 use querylens::prompt::{build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation};
@@ -73,6 +74,30 @@ enum Commands {
         file: Option<PathBuf>,
         #[arg(long)]
         sql: Option<String>,
+    },
+    /// Estimate scan/cost risk for a single query using optional table stats
+    Cost {
+        file: PathBuf,
+        #[arg(long, default_value = "athena")]
+        engine: String,
+        #[arg(long)]
+        stats_file: Option<PathBuf>,
+        #[arg(long)]
+        scan_bytes: Option<u64>,
+        #[arg(long)]
+        scan_tb: Option<f64>,
+    },
+    /// Collect table stats into a JSON file (currently supports postgres via psql)
+    CollectStats {
+        #[arg(long, default_value = "postgres")]
+        engine: String,
+        #[arg(long, help = "Output stats JSON path")]
+        out: PathBuf,
+        #[arg(
+            long,
+            help = "Postgres connection URL (psql style); defaults to DATABASE_URL env"
+        )]
+        database_url: Option<String>,
     },
     Analyze {
         dir: PathBuf,
@@ -159,6 +184,20 @@ struct Args {
 
     #[arg(long, global = true)]
     stats_file: Option<PathBuf>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Show only the top N findings per file in output (does not change analysis/severity)"
+    )]
+    top_findings: Option<usize>,
+
+    #[arg(
+        long,
+        global = true,
+        help = "Print AWS CLI stdout/stderr when fetching Athena execution stats (debugging)"
+    )]
+    aws_verbose: bool,
 }
 
 #[derive(Debug)]
@@ -1005,16 +1044,13 @@ fn estimated_scan_label(args: &Args, sql: Option<&str>) -> anyhow::Result<String
         return Ok(format!("{tb:.2} TB"));
     }
     if let Some(bytes) = args.scan_bytes {
-        let tb = bytes as f64 / 1_000_000_000_000_f64;
-        return Ok(format!("{tb:.2} TB"));
+        return Ok(bytes_to_human_label(Some(bytes)));
     }
     if let Some(bytes) = fetch_athena_scanned_bytes(args)? {
-        let tb = bytes as f64 / 1_000_000_000_000_f64;
-        return Ok(format!("{tb:.2} TB"));
+        return Ok(bytes_to_human_label(Some(bytes)));
     }
     if let Some(bytes) = estimate_scan_from_stats_file(args, sql)? {
-        let tb = bytes as f64 / 1_000_000_000_000_f64;
-        return Ok(format!("{tb:.2} TB"));
+        return Ok(bytes_to_human_label(Some(bytes)));
     }
     Ok("unknown".to_string())
 }
@@ -1036,22 +1072,48 @@ fn fetch_athena_scanned_bytes(args: &Args) -> anyhow::Result<Option<u64>> {
         cmd.arg("--region").arg(region);
     }
 
-    let output = cmd
-        .output()
-        .map_err(|e| anyhow::anyhow!("failed to execute aws cli for Athena lookup: {e}"))?;
+    let output = cmd.output();
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            // If aws CLI is missing or not executable, return None gracefully.
+            return if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(anyhow::anyhow!(
+                    "failed to execute aws cli for Athena lookup: {e}"
+                ))
+            };
+        }
+    };
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow::anyhow!(
-            "aws athena get-query-execution failed for {}: {}",
-            execution_id,
-            stderr.trim()
-        ));
+        if args.aws_verbose {
+            eprintln!(
+                "aws athena stdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            eprintln!(
+                "aws athena stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        // Treat CLI failures as "no data"; don't fail the run.
+        return Ok(None);
     }
 
-    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e| {
-        anyhow::anyhow!("failed to parse Athena get-query-execution output as JSON: {e}")
-    })?;
+    let value: serde_json::Value = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            if args.aws_verbose {
+                eprintln!(
+                    "failed to parse Athena get-query-execution output as JSON: {e}\nstdout:{}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
+            return Ok(None);
+        }
+    };
 
     let scanned = value["QueryExecution"]["Statistics"]["DataScannedInBytes"]
         .as_u64()
@@ -1318,6 +1380,24 @@ fn build_effective_static_explanation(
     parsed
 }
 
+#[allow(dead_code)]
+fn truncated_explanation(parsed: &SqlExplanation, limit: Option<usize>) -> SqlExplanation {
+    if let Some(n) = limit {
+        let mut out = parsed.clone();
+        out.findings.truncate(out.findings.len().min(n));
+        out.anti_patterns.truncate(out.anti_patterns.len().min(n));
+        return out;
+    }
+    parsed.clone()
+}
+
+fn truncate_strings(mut items: Vec<String>, limit: Option<usize>) -> Vec<String> {
+    if let Some(n) = limit {
+        items.truncate(items.len().min(n));
+    }
+    items
+}
+
 fn build_risk_report(path: &Path, findings: &[Finding], estimated_scan: String) -> RiskReport {
     let mut reasons = Vec::new();
     for finding in findings {
@@ -1362,6 +1442,37 @@ fn render_risk_report(report: &RiskReport) -> String {
     out.push_str("\nEstimated scan: ");
     out.push_str(&report.estimated_scan);
     out.push('\n');
+    out
+}
+
+fn render_cost_report(est: &CostEstimate) -> String {
+    let mut out = String::new();
+    out.push_str(&est.file);
+    out.push('\n');
+    out.push_str("Engine: ");
+    out.push_str(&est.engine);
+    out.push_str("\nEstimated scan: ");
+    out.push_str(&est.estimated_scan_human);
+    out.push('\n');
+    out.push_str("Estimated cost: ");
+    out.push_str(
+        est.estimated_cost_usd
+            .map(|v| format!("${:.2}", v))
+            .unwrap_or_else(|| "unknown".to_string())
+            .as_str(),
+    );
+    out.push('\n');
+    out.push_str("Confidence: ");
+    out.push_str(&est.confidence);
+    out.push('\n');
+    if !est.signals.is_empty() {
+        out.push_str("Signals:\n");
+        for s in &est.signals {
+            out.push_str("- ");
+            out.push_str(s);
+            out.push('\n');
+        }
+    }
     out
 }
 
@@ -2173,6 +2284,53 @@ async fn main() -> Result<(), anyhow::Error> {
                 print!("{}", render_lineage(file, &sql, column.as_deref()));
                 return Ok(());
             }
+            Commands::Cost {
+                file,
+                engine,
+                stats_file,
+                scan_bytes,
+                scan_tb,
+            } => {
+                let sql = read_sql_file(file)?;
+                let mut options = analysis_options(&config);
+                if let Some(dialect) = args.dialect {
+                    options.dialect = cli_dialect(dialect);
+                }
+                let parsed = build_effective_static_explanation(&sql, options, &config);
+                let stats = stats_file
+                    .as_ref()
+                    .map(|p| load_stats_map(p))
+                    .transpose()?
+                    .unwrap_or_default();
+                let est = estimate_cost(&sql, &parsed, engine, &stats, *scan_bytes, *scan_tb);
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&est)?);
+                } else {
+                    print!("{}", render_cost_report(&est));
+                }
+                return Ok(());
+            }
+            Commands::CollectStats {
+                engine,
+                out,
+                database_url,
+            } => {
+                if engine == "postgres" {
+                    let url = database_url
+                        .clone()
+                        .or_else(|| std::env::var("DATABASE_URL").ok())
+                        .ok_or_else(|| anyhow::anyhow!("DATABASE_URL not provided"))?;
+                    let stats = collect_postgres_stats(&url)?;
+                    std::fs::write(out, serde_json::to_string_pretty(&stats)?)?;
+                    println!("Wrote stats to {}", out.display());
+                    return Ok(());
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "collect-stats for engine={} not implemented",
+                        engine
+                    ));
+                }
+            }
             Commands::Risk { file, summary_only } => {
                 let sql = read_sql_file(file)?;
                 let mut options = analysis_options(&config);
@@ -2180,9 +2338,10 @@ async fn main() -> Result<(), anyhow::Error> {
                     options.dialect = cli_dialect(dialect);
                 }
                 let parsed = build_effective_static_explanation(&sql, options, &config);
+                let display = truncated_explanation(&parsed, args.top_findings);
                 let report = build_risk_report(
                     file,
-                    &parsed.findings,
+                    &display.findings,
                     estimated_scan_label(&args, Some(&sql))?,
                 );
                 if args.json {
@@ -2491,18 +2650,27 @@ async fn main() -> Result<(), anyhow::Error> {
                     let curr_rules: HashSet<String> =
                         curr_findings.iter().map(|f| f.rule_id.clone()).collect();
 
-                    let new_rules = curr_rules
-                        .difference(&prev_rules)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let resolved_rules = prev_rules
-                        .difference(&curr_rules)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let persistent_rules = curr_rules
-                        .intersection(&prev_rules)
-                        .cloned()
-                        .collect::<Vec<_>>();
+                    let new_rules = truncate_strings(
+                        curr_rules
+                            .difference(&prev_rules)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        args.top_findings,
+                    );
+                    let resolved_rules = truncate_strings(
+                        prev_rules
+                            .difference(&curr_rules)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        args.top_findings,
+                    );
+                    let persistent_rules = truncate_strings(
+                        curr_rules
+                            .intersection(&prev_rules)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                        args.top_findings,
+                    );
 
                     let prev_risk = max_finding_severity(&prev_findings);
                     let curr_risk = max_finding_severity(&curr_findings);
@@ -2645,10 +2813,11 @@ async fn main() -> Result<(), anyhow::Error> {
         InputMode::Sql(sql) => {
             let mut parsed = analyze_single_sql(&sql, static_only, &args, options).await?;
             apply_rule_controls(&mut parsed, &config);
+            let display = truncated_explanation(&parsed, args.top_findings);
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&parsed)?);
+                println!("{}", serde_json::to_string_pretty(&display)?);
             } else {
-                print!("{}", render_explanation(&parsed));
+                print!("{}", render_explanation(&display));
             }
 
             if should_fail(&parsed.findings, threshold) {
@@ -2662,10 +2831,11 @@ async fn main() -> Result<(), anyhow::Error> {
                 parsed.summary = format!("Static analysis for {}", path.display());
             }
 
+            let display = truncated_explanation(&parsed, args.top_findings);
             if args.json {
-                println!("{}", serde_json::to_string_pretty(&parsed)?);
+                println!("{}", serde_json::to_string_pretty(&display)?);
             } else {
-                print!("{}", render_explanation(&parsed));
+                print!("{}", render_explanation(&display));
             }
 
             if should_fail(&parsed.findings, threshold) {
@@ -3010,6 +3180,8 @@ mod tests {
             athena_query_execution_id: None,
             athena_region: None,
             stats_file: None,
+            top_findings: None,
+            aws_verbose: false,
         };
 
         let input = read_input(&args).expect("inline SQL should be accepted");
@@ -3035,6 +3207,8 @@ mod tests {
             athena_query_execution_id: None,
             athena_region: None,
             stats_file: None,
+            top_findings: None,
+            aws_verbose: false,
         };
 
         let input = read_input(&args).expect("file input should be accepted");
@@ -3063,6 +3237,8 @@ mod tests {
             athena_query_execution_id: None,
             athena_region: None,
             stats_file: None,
+            top_findings: None,
+            aws_verbose: false,
         };
 
         let input = read_input(&args).expect("dir input should be accepted");
@@ -3088,6 +3264,8 @@ mod tests {
             athena_query_execution_id: None,
             athena_region: None,
             stats_file: None,
+            top_findings: None,
+            aws_verbose: false,
         };
 
         let err = read_input(&args).expect_err("missing input should fail");
@@ -3249,6 +3427,8 @@ mod tests {
             athena_query_execution_id: None,
             athena_region: None,
             stats_file: None,
+            top_findings: None,
+            aws_verbose: false,
         };
         assert_eq!(
             super::estimated_scan_label(&args, Some("SELECT * FROM orders")).expect("label"),
@@ -3288,6 +3468,8 @@ mod tests {
             athena_query_execution_id: None,
             athena_region: None,
             stats_file: Some(path.clone()),
+            top_findings: None,
+            aws_verbose: false,
         };
 
         let label = super::estimated_scan_label(
@@ -3332,6 +3514,8 @@ mod tests {
             athena_query_execution_id: None,
             athena_region: None,
             stats_file: Some(path.clone()),
+            top_findings: None,
+            aws_verbose: false,
         };
 
         let label = super::estimated_scan_label(

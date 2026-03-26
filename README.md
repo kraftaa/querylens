@@ -57,24 +57,19 @@ cargo build
 
 Scan estimates (optional)
 
-- Athena (post-run calibration): `querylens explain --athena-query-execution-id <id> --athena-region us-east-1 --file your.sql` uses `aws athena get-query-execution` to pull `DataScannedInBytes` from a past run. Use this to compare a real scan to our estimate or as the “before” value in PR cost diff. Not for brand-new queries.
+- Athena (post-run calibration): `querylens explain --athena-query-execution-id <id> --athena-region us-east-1 --file your.sql` uses `aws athena get-query-execution` to pull `DataScannedInBytes` from a past run. If AWS CLI is missing or fails, we fall back to “unknown”.
 - Manual override: `--scan-tb 1.5` or `--scan-bytes 1500000000000`.
 - Table stats file (offline, no cloud calls): `--stats-file stats.json`
+- Cost-only workflow (no LLM): `querylens cost --file your.sql --stats-file stats.json`
+- Collect Postgres stats into a JSON file: `querylens collect-stats --engine postgres --out stats.json --database-url "$DATABASE_URL"`
 
 Example `stats.json`:
 
 ```json
 {
   "tables": {
-    "athena.sales": {
-      "total_bytes": 1200000000000,
-      "row_count": 3500000000,
-      "partition_columns": ["ds"],
-      "partitions_per_year": 365
-    },
-    "athena.customers": {
-      "total_bytes": 8000000000
-    }
+    "athena.sales": { "total_bytes": 1200000000000, "row_count": 3500000000, "partition_columns": ["ds"], "format": "parquet" },
+    "athena.customers": { "total_bytes": 8000000000 }
   }
 }
 ```
@@ -211,6 +206,8 @@ cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql"
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --ci
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --markdown
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --cost-diff --stats-file stats.json
+cargo run -- cost --file models/orders.sql --engine athena --stats-file stats.json
+cargo run -- collect-stats --engine postgres --out stats.json --database-url "$DATABASE_URL"
 ```
 
 ### PR review mode
@@ -381,13 +378,29 @@ Use one of:
 - `--athena-region <region>` optional region override for Athena lookup
 - `--stats-file <path.json>` to estimate scan bytes from table-level stats
 
-Example `stats.json`:
+### Cost mode (static estimate)
+
+```bash
+querylens cost --file examples/revenue.sql --engine athena --stats-file stats.json
+```
+
+- Uses static analysis + optional stats to estimate scanned bytes and Athena cost (uses ~$5/TB).
+- Accepts the same overrides as risk/explain: `--scan-tb`, `--scan-bytes`, `--athena-query-execution-id`.
+- If stats or AWS bytes are missing, prints `estimated_scan: unknown` but still shows risk signals.
+
+`collect-stats` can create a stats file from Postgres:
+
+```bash
+querylens collect-stats --engine postgres --out stats.json --database-url "$DATABASE_URL"
+```
+
+Output looks like:
 
 ```json
 {
   "tables": {
-    "orders": { "bytes": 1000000000000 },
-    "customers": 200000000000
+    "orders": { "total_bytes": 1000000000000, "row_count": 12000000 },
+    "customers": { "total_bytes": 200000000000 }
   }
 }
 ```

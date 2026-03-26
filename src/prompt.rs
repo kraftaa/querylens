@@ -62,7 +62,7 @@ where
     })
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SqlExplanation {
     pub summary: String,
     #[serde(default)]
