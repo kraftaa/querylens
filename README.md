@@ -89,6 +89,8 @@ Heuristics:
 | Query explanation | Summarize tables, joins, aggregations, and likely query meaning |
 | Table extraction | List tables used by a query |
 | Folder scanning | Analyze a directory of SQL files |
+| dbt DAG audit | Detect structural hotspots, layer violations, fan-in/fan-out risk, and domain coupling from `manifest.json` |
+| dbt PR DAG review | Compare two manifests and fail CI on complexity regressions |
 | Rule controls | Disable rules or override severity by `rule_id` |
 | Athena mode | Extra heuristics for partition/cost patterns |
 | CI thresholds | Fail on `low|medium|high` severity |
@@ -206,9 +208,34 @@ cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql"
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --ci
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --markdown
 cargo run -- pr-review --base main --head HEAD --dir models --glob "*.sql" --cost-diff --stats-file stats.json
+cargo run -- dbt-audit target/manifest.json
+cargo run -- dbt-audit target/manifest.json --fan-in-threshold 6 --fan-out-threshold 8 --domain-coupling-threshold 5 --hotspot-threshold 14
+cargo run -- dbt-pr-review --base old_manifest.json --new new_manifest.json
 cargo run -- cost --file models/orders.sql --engine athena --stats-file stats.json
 cargo run -- collect-stats --engine postgres --out stats.json --database-url "$DATABASE_URL"
 ```
+
+### dbt structural audit
+
+```bash
+cargo run -- dbt-audit target/manifest.json
+```
+
+`dbt-audit` is deterministic and graph-based. It reports actionable findings such as:
+
+- marts depending on marts
+- forbidden layer edges (for example marts depending directly on staging, or staging depending on marts)
+- extreme fan-in / fan-out models
+- domain coupling edges above threshold
+- structural hotspots ranked by combined graph risk signals
+
+PR comparison mode:
+
+```bash
+cargo run -- dbt-pr-review --base old_manifest.json --new new_manifest.json
+```
+
+This reports introduced/resolved findings and whether DAG complexity regressed.
 
 ### PR review mode
 
@@ -580,7 +607,9 @@ Ready-to-run examples:
 - `examples/revenue.sql`
 - `examples/bad_join.sql`
 - `examples/subquery.sql`
-- `examples/silver_proposal_attachments.sql`
+- `examples/request_attachment_links.sql`
+- `examples/order_milestone_pricing.sql`
+- `examples/entity_status_snapshot.sql`
 
 ## Project Layout
 

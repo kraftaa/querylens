@@ -1,7 +1,13 @@
 use clap::{Parser, ValueEnum};
 use querylens::analyzer::{analyze_sql, AnalysisOptions, Dialect, StaticAnalysis};
 use querylens::config::{load_config, SqlInspectConfig};
-use querylens::cost::{collect_postgres_stats, estimate_cost, load_stats_map, CostEstimate};
+use querylens::cost::{
+    bytes_to_human_label, collect_postgres_stats, estimate_cost, estimate_scan_from_stats,
+    load_stats_map, normalize_stats_map_keys, CostEstimate,
+};
+use querylens::dbt::{
+    audit_manifest, dbt_pr_review, render_dbt_audit, render_dbt_pr_review, DbtAuditOptions,
+};
 use querylens::error::AppError;
 use querylens::insights::{explain_query, extract_lineage_report, extract_tables};
 use querylens::prompt::{build_prompt, parse_sql_explanation, Finding, Severity, SqlExplanation};
@@ -82,9 +88,9 @@ enum Commands {
         engine: String,
         #[arg(long)]
         stats_file: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "scan_tb")]
         scan_bytes: Option<u64>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "scan_bytes")]
         scan_tb: Option<f64>,
     },
     /// Collect table stats into a JSON file (currently supports postgres via psql)
@@ -127,6 +133,35 @@ enum Commands {
         markdown: bool,
         #[arg(long, default_value_t = false, conflicts_with_all = ["ci", "markdown"])]
         cost_diff: bool,
+    },
+    DbtAudit {
+        manifest: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        fan_in_threshold: usize,
+        #[arg(long, default_value_t = 8)]
+        fan_out_threshold: usize,
+        #[arg(long, default_value_t = 6)]
+        domain_coupling_threshold: usize,
+        #[arg(long, default_value_t = 18)]
+        hotspot_threshold: u32,
+        #[arg(long, default_value_t = 25)]
+        top: usize,
+    },
+    DbtPrReview {
+        #[arg(long)]
+        base: PathBuf,
+        #[arg(long = "new")]
+        new_manifest: PathBuf,
+        #[arg(long, default_value_t = 8)]
+        fan_in_threshold: usize,
+        #[arg(long, default_value_t = 8)]
+        fan_out_threshold: usize,
+        #[arg(long, default_value_t = 6)]
+        domain_coupling_threshold: usize,
+        #[arg(long, default_value_t = 18)]
+        hotspot_threshold: u32,
+        #[arg(long, default_value_t = 25)]
+        top: usize,
     },
 }
 
@@ -1131,140 +1166,10 @@ fn estimate_scan_from_stats_file(args: &Args, sql: Option<&str>) -> anyhow::Resu
         return Ok(None);
     };
 
-    let raw = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("failed to read stats file {}: {e}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        anyhow::anyhow!("failed to parse stats file {} as JSON: {e}", path.display())
-    })?;
-
-    let tables = extract_tables(sql);
-    if tables.is_empty() {
-        return Ok(None);
-    }
-
-    let mut total = 0_u64;
-    let mut matched = false;
-    let filters = extract_lineage_report(sql).filters;
-
-    for table in tables {
-        if let Some(stats) = parse_table_stats(&value, &table) {
-            if let Some(bytes) = stats.total_bytes {
-                let fraction = estimate_scan_fraction(&stats, &filters);
-                total = total.saturating_add((bytes as f64 * fraction) as u64);
-                matched = true;
-                continue;
-            }
-        }
-
-        // Fallback: accept bare bytes at top-level for the table
-        if let Some(bytes) = parse_bytes_value(
-            value
-                .get("tables")
-                .and_then(|v| v.get(&table))
-                .unwrap_or_else(|| value.get(&table).unwrap_or(&serde_json::Value::Null)),
-        ) {
-            let fraction = if filters.is_empty() { 1.0 } else { 0.7 };
-            total = total.saturating_add((bytes as f64 * fraction) as u64);
-            matched = true;
-        }
-    }
-
-    if matched {
-        Ok(Some(total))
-    } else {
-        Ok(None)
-    }
-}
-
-#[derive(Default)]
-struct TableStats {
-    total_bytes: Option<u64>,
-    row_count: Option<u64>,
-    partition_columns: Vec<String>,
-    partitions_per_year: Option<u32>,
-}
-
-fn parse_table_stats(root: &serde_json::Value, table: &str) -> Option<TableStats> {
-    let node = root
-        .get("tables")
-        .and_then(|v| v.get(table))
-        .or_else(|| root.get(table))?;
-
-    let stats = TableStats {
-        total_bytes: parse_bytes_value(node.get("total_bytes").unwrap_or(node)),
-        row_count: node
-            .get("row_count")
-            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())),
-        partition_columns: node
-            .get("partition_columns")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_ascii_lowercase()))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        partitions_per_year: node
-            .get("partitions_per_year")
-            .and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok()))
-            .map(|n| n as u32),
-    };
-
-    if stats.total_bytes.is_none()
-        && stats.row_count.is_none()
-        && stats.partition_columns.is_empty()
-    {
-        None
-    } else {
-        Some(stats)
-    }
-}
-
-fn parse_bytes_value(value: &serde_json::Value) -> Option<u64> {
-    if let Some(n) = value.as_u64() {
-        return Some(n);
-    }
-    if let Some(s) = value.as_str() {
-        return s.parse::<u64>().ok();
-    }
-    value.get("bytes").and_then(|v| {
-        v.as_u64()
-            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
-    })
-}
-
-fn estimate_scan_fraction(stats: &TableStats, filters: &[String]) -> f64 {
-    if stats.partition_columns.is_empty() {
-        return if filters.is_empty() { 1.0 } else { 0.7 };
-    }
-
-    let filters_lower: Vec<String> = filters.iter().map(|f| f.to_ascii_lowercase()).collect();
-    let mut matches_partition = false;
-    for part in &stats.partition_columns {
-        if filters_lower.iter().any(|f| f.contains(part)) {
-            matches_partition = true;
-            break;
-        }
-    }
-
-    if matches_partition {
-        // If we see an obvious range, assume a small slice; otherwise even smaller.
-        let has_range = filters_lower
-            .iter()
-            .any(|f| f.contains("between") || f.contains(">") || f.contains("<"));
-        if let Some(parts) = stats.partitions_per_year {
-            // crude: assume daily partitions
-            let days = if has_range { 30.0 } else { 1.0 };
-            return (days / parts.max(1) as f64).clamp(0.01, 1.0);
-        }
-        return if has_range { 0.05 } else { 0.02 };
-    }
-
-    if filters.is_empty() {
-        1.0
-    } else {
-        0.7
-    }
+    let stats = load_stats_map(path)
+        .map_err(|e| anyhow::anyhow!("failed to load stats file {}: {e}", path.display()))?;
+    let stats = normalize_stats_map_keys(&stats);
+    Ok(estimate_scan_from_stats(sql, &stats))
 }
 
 fn guard_block_reasons(
@@ -1380,7 +1285,6 @@ fn build_effective_static_explanation(
     parsed
 }
 
-#[allow(dead_code)]
 fn truncated_explanation(parsed: &SqlExplanation, limit: Option<usize>) -> SqlExplanation {
     if let Some(n) = limit {
         let mut out = parsed.clone();
@@ -1588,22 +1492,6 @@ fn render_folder_summary_with_verbose(
 fn bytes_to_tb_label(bytes: Option<u64>) -> String {
     match bytes {
         Some(bytes) => format!("{:.2} TB", bytes as f64 / 1_000_000_000_000_f64),
-        None => "unknown".to_string(),
-    }
-}
-
-fn bytes_to_human_label(bytes: Option<u64>) -> String {
-    match bytes {
-        Some(bytes) if bytes >= 1_000_000_000_000 => {
-            format!("{:.2} TB", bytes as f64 / 1_000_000_000_000_f64)
-        }
-        Some(bytes) if bytes >= 1_000_000_000 => {
-            format!("{:.0} GB", bytes as f64 / 1_000_000_000_f64)
-        }
-        Some(bytes) if bytes >= 1_000_000 => {
-            format!("{:.0} MB", bytes as f64 / 1_000_000_f64)
-        }
-        Some(bytes) => format!("{bytes} B"),
         None => "unknown".to_string(),
     }
 }
@@ -2299,10 +2187,28 @@ async fn main() -> Result<(), anyhow::Error> {
                 let parsed = build_effective_static_explanation(&sql, options, &config);
                 let stats = stats_file
                     .as_ref()
+                    .or(args.stats_file.as_ref())
                     .map(|p| load_stats_map(p))
                     .transpose()?
                     .unwrap_or_default();
-                let est = estimate_cost(&sql, &parsed, engine, &stats, *scan_bytes, *scan_tb);
+                let stats = normalize_stats_map_keys(&stats);
+                let effective_scan_tb = scan_tb.or(args.scan_tb);
+                let effective_scan_bytes = if effective_scan_tb.is_some() {
+                    scan_bytes.or(args.scan_bytes)
+                } else {
+                    scan_bytes
+                        .or(args.scan_bytes)
+                        .or(fetch_athena_scanned_bytes(&args)?)
+                };
+                let est = estimate_cost(
+                    &file.display().to_string(),
+                    &sql,
+                    &parsed,
+                    engine,
+                    &stats,
+                    effective_scan_bytes,
+                    effective_scan_tb,
+                );
                 if args.json {
                     println!("{}", serde_json::to_string_pretty(&est)?);
                 } else {
@@ -2786,6 +2692,67 @@ async fn main() -> Result<(), anyhow::Error> {
                 }
                 return Ok(());
             }
+            Commands::DbtAudit {
+                manifest,
+                fan_in_threshold,
+                fan_out_threshold,
+                domain_coupling_threshold,
+                hotspot_threshold,
+                top,
+            } => {
+                let report = audit_manifest(
+                    manifest,
+                    DbtAuditOptions {
+                        fan_in_threshold: *fan_in_threshold,
+                        fan_out_threshold: *fan_out_threshold,
+                        domain_coupling_threshold: *domain_coupling_threshold,
+                        hotspot_threshold: *hotspot_threshold,
+                    },
+                )?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", render_dbt_audit(&report, *top));
+                }
+
+                let threshold = args
+                    .fail_on
+                    .map(to_severity)
+                    .or_else(|| config_fail_on(&config));
+                if should_fail(&report.findings, threshold) {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            Commands::DbtPrReview {
+                base,
+                new_manifest,
+                fan_in_threshold,
+                fan_out_threshold,
+                domain_coupling_threshold,
+                hotspot_threshold,
+                top,
+            } => {
+                let report = dbt_pr_review(
+                    base,
+                    new_manifest,
+                    DbtAuditOptions {
+                        fan_in_threshold: *fan_in_threshold,
+                        fan_out_threshold: *fan_out_threshold,
+                        domain_coupling_threshold: *domain_coupling_threshold,
+                        hotspot_threshold: *hotspot_threshold,
+                    },
+                )?;
+                if args.json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    print!("{}", render_dbt_pr_review(&report, *top));
+                }
+                if report.summary.status == "FAIL" {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
         }
     }
 
@@ -3014,6 +2981,37 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn args_parse_dbt_audit_subcommand() {
+        let args = Args::try_parse_from([
+            "querylens",
+            "dbt-audit",
+            "target/manifest.json",
+            "--fan-in-threshold",
+            "5",
+            "--top",
+            "15",
+        ])
+        .expect("dbt-audit args should parse");
+        assert!(matches!(args.command, Some(Commands::DbtAudit { .. })));
+    }
+
+    #[test]
+    fn args_parse_dbt_pr_review_subcommand() {
+        let args = Args::try_parse_from([
+            "querylens",
+            "dbt-pr-review",
+            "--base",
+            "old_manifest.json",
+            "--new",
+            "new_manifest.json",
+            "--hotspot-threshold",
+            "12",
+        ])
+        .expect("dbt-pr-review args should parse");
+        assert!(matches!(args.command, Some(Commands::DbtPrReview { .. })));
     }
 
     #[test]
